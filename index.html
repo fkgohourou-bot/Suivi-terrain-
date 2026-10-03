@@ -17255,13 +17255,13 @@ const DEFAULT_PRODUCTS = [
 const emptyData = () => ({
     families: DEFAULT_FAMILIES, products: DEFAULT_PRODUCTS,
     objectives: {}, pdvTargets: {}, depart: null, rules: [],
-    plans: [], enlevements: [], versements: [],
+    plans: [], enlevements: [], versements: [], sorties: [],
     clients: [], ventes: [], recouvrements: [], livraisons: [],
 });
 const migrate = (d) => {
     const x = { ...emptyData(), ...(d && typeof d === "object" ? d : {}) };
     /* nettoyage défensif : une donnée abîmée ne doit jamais bloquer l'application */
-    ["plans", "enlevements", "versements", "clients", "ventes", "recouvrements", "livraisons", "rules", "families", "products"].forEach((k) => { if (!Array.isArray(x[k]))
+    ["plans", "enlevements", "versements", "sorties", "clients", "ventes", "recouvrements", "livraisons", "rules", "families", "products"].forEach((k) => { if (!Array.isArray(x[k]))
         x[k] = emptyData()[k]; });
     const okRec = (r) => r && typeof r === "object" && typeof r.date === "string" && r.date.length >= 10;
     ["plans", "enlevements", "ventes", "livraisons"].forEach((k) => { x[k] = x[k].filter(okRec).map((r) => ({ ...r, items: r.items && typeof r.items === "object" ? r.items : {} })); });
@@ -17327,6 +17327,23 @@ const datesEvery = (start, every, m) => { const out = []; let d = start; const e
     out.push(d);
     d = addDays(d, Math.max(1, every));
 } return out; };
+function ClientSearch({ clients, onSelect, qc, setQc, placeholder = "Nom, quartier, contact, téléphone…", onVendre }) {
+    const [open_, setOpen_] = useState(false);
+    const ref = useRef(null);
+    const hits = qc.trim() ? clients.filter((c) => matchC(c, qc)).slice(0, 8) : [];
+    useEffect(() => {
+        const fn = (e) => { if (ref.current && !ref.current.contains(e.target))
+            setOpen_(false); };
+        document.addEventListener("pointerdown", fn);
+        return () => document.removeEventListener("pointerdown", fn);
+    }, []);
+    return (React.createElement("div", { className: "csearch", ref: ref },
+        React.createElement("input", { value: qc, onChange: (e) => { setQc(e.target.value); setOpen_(true); }, onFocus: () => qc.trim() && setOpen_(true), placeholder: placeholder, autoComplete: "off" }),
+        open_ && hits.length > 0 && (React.createElement("div", { className: "csearch-drop" }, hits.map((c) => (React.createElement("div", { key: c.id, className: "csearch-item", onPointerDown: (e) => { e.preventDefault(); setQc(""); setOpen_(false); onSelect(c.id); } },
+            React.createElement("span", { className: "csearch-name" }, c.name),
+            place(c) && React.createElement("span", { className: "csearch-sub" }, place(c)),
+            onVendre && React.createElement("button", { className: "btn primary sm", onPointerDown: (e) => { e.stopPropagation(); setQc(""); setOpen_(false); onVendre(c.id); } }, "Vendre"))))))));
+}
 const matchC = (c, q) => !q.trim() || [c.name, c.quartier, c.ville, c.contact, c.phone].filter(Boolean).join(" ").toLowerCase().includes(q.trim().toLowerCase());
 const place = (c) => [c.quartier, c.ville].filter(Boolean).join(", ");
 const distM = (a, b) => {
@@ -17364,6 +17381,15 @@ function GeoLine({ state, geo, client }) {
         return null;
     return React.createElement("p", { className: "geo far" }, "Position indisponible sur cet appareil. La vente reste possible.");
 }
+const fmtQty = (qty, cdt) => {
+    const q = +qty || 0;
+    if (!cdt || cdt <= 1)
+        return { ctn: Math.round(q), u: 0, label: `${Number.isInteger(q) ? q : q.toFixed(2).replace(".", ",")} ctn` };
+    const c = Math.floor(q);
+    const u = Math.round((q - c) * cdt);
+    const label = c > 0 && u > 0 ? `${c} ctn + ${u} u` : c > 0 ? `${c} ctn` : `${u} u`;
+    return { ctn: c, u, label };
+};
 const credit = (v) => v.total - (v.cash || 0) - (v.momo || 0);
 const modeLabel = (k) => (k === "momo" ? "Mobile money" : "Espèces");
 const hm = (ts) => { try {
@@ -17400,11 +17426,12 @@ function computeGlobal(data) {
     const stock = addInto({}, dep.stock);
     data.enlevements.forEach((e) => addInto(stock, e.items));
     data.ventes.forEach((v) => addInto(stock, v.items, -1));
+    (data.sorties || []).filter((s) => !s.cancelled).forEach((s) => addInto(stock, s.items, -1));
     const caisse = { especes: +dep.especes || 0, momo: +dep.momo || 0 };
     data.ventes.forEach((v) => { caisse.especes += v.cash || 0; caisse.momo += v.momo || 0; });
     data.recouvrements.forEach((r) => (caisse[r.mode === "momo" ? "momo" : "especes"] += r.amount));
     data.versements.forEach((v) => { caisse.especes -= v.especes || 0; caisse.momo -= v.momo || 0; });
-    const dette = (+dep.solde || 0) + data.enlevements.reduce((a, e) => a + e.montant, 0) - data.versements.reduce((a, v) => a + v.amount, 0);
+    const dette = (+dep.solde || 0) + data.enlevements.reduce((a, e) => a + e.montant, 0) - data.versements.reduce((a, v) => a + v.amount, 0) - (data.sorties || []).filter((s) => !s.cancelled && s.montantRetour).reduce((a, s) => a + (s.montantRetour || 0), 0);
     const stockValue = data.products.reduce((a, p) => a + Math.max(0, stock[p.id] || 0) * p.price, 0);
     return { stock, caisse, dette, stockValue };
 }
@@ -17437,7 +17464,13 @@ function computeMonth(data, m) {
         encEsp, encMomo, encaisse: encEsp + encMomo, primeTotal: fams.reduce((a, f) => a + f.prime, 0),
     };
 }
-const clientDebt = (data, cid) => data.ventes.filter((v) => v.clientId === cid).reduce((a, v) => a + credit(v), 0) - data.recouvrements.filter((r) => r.clientId === cid).reduce((a, r) => a + r.amount, 0);
+const clientDebt = (data, cid) => {
+    const cl = data.clients.find((c) => c.id === cid);
+    const init = (cl === null || cl === void 0 ? void 0 : cl.debtInit) || 0;
+    const credited = data.ventes.filter((v) => v.clientId === cid && !v.cancelled).reduce((a, v) => a + credit(v), 0);
+    const recovered = data.recouvrements.filter((r) => r.clientId === cid && !r.cancelled).reduce((a, r) => a + r.amount, 0);
+    return init + credited - recovered;
+};
 const computeCreances = (data) => data.clients.map((c) => ({ ...c, solde: clientDebt(data, c.id) })).filter((c) => c.solde > 0.5).sort((a, b) => b.solde - a.solde);
 /* ---------- Export Excel (fichier .xls créé sur le téléphone, sans internet) ---------- */
 const xmlEsc = (v) => String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -17488,6 +17521,117 @@ function pdvReport(data, m) {
     });
 }
 function exportXlsx(data, m, st, cre, g) {
+    var _a;
+    const r = data.receipt || {};
+    const nom = r.name || ((_a = data.receipt) === null || _a === void 0 ? void 0 : _a.from) || "COMMERCIAL";
+    const depot = r.depot || "DEPOT";
+    const zone = r.zone || "";
+    const today_ = today();
+    const inM = (x) => x.date.slice(0, 7) === m;
+    const vM = data.ventes.filter((v) => inM(v) && !v.cancelled);
+    const totalCreances = cre.filter((c) => c.solde > 0).reduce((a, c) => a + c.solde, 0);
+    const espDispo = g.caisse.especes + g.caisse.momo;
+    const totalFinance = totalCreances + espDispo;
+    const inventaire = g.dette - (g.stockValue + totalFinance);
+    const pr = pdvReport(data, m);
+    /* ======= Feuille 1 : INVENTAIRE (modèle principal) ======= */
+    const E = (v) => v !== null && v !== void 0 ? v : "";
+    const N = (v) => typeof v === "number" ? v : (Number(v) || 0);
+    const inv_rows = [];
+    const B = (txt) => inv_rows.push(["", txt]);
+    const BV = (lbl, val) => inv_rows.push(["", lbl, val]);
+    B("FICHIER INVENTAIRE");
+    B("");
+    BV("DATE", today_);
+    BV("DEPOT", depot);
+    BV("COMMERCIAL", nom);
+    BV("CHEF DE ZONE / RESPONSABLE", zone);
+    B("");
+    B("ETAT FINANCIER");
+    B("");
+    BV("SOLDE DU COMPTE", Math.round(g.dette));
+    BV("VALEUR TOTAL DU STOCK", Math.round(g.stockValue));
+    BV("TOTAL CREANCES", Math.round(totalCreances));
+    BV("ESPECES DISPONIBLES", Math.round(espDispo));
+    BV("  dont Espèces en main", Math.round(g.caisse.especes));
+    BV("  dont Mobile Money", Math.round(g.caisse.momo));
+    BV("TOTAL FINANCE (Créances + Espèces)", Math.round(totalFinance));
+    BV("RESULTAT INVENTAIRE", Math.round(inventaire));
+    inv_rows.push(["", "COMMENTAIRE :", inventaire > 0 ? "RESULTAT POSITIF = PERTE DEPOT" : "RESULTAT NEGATIF = BENEFICE DEPOT"]);
+    B("");
+    B("RESULTAT INVENTAIRE NEGATIF = BENEFICE DEPOT ; RESULTAT POSITIF = PERTE DEPOT");
+    B("");
+    B("");
+    /* -- Section STOCK VEHICULE -- */
+    inv_rows.push(["", "", "", "STOCK VEHICULE"]);
+    inv_rows.push(["", "PRODUITS", "PRIX DEPOT", "CARTONS", "UNITES SUP.", "VALEUR"]);
+    data.families.forEach((fam) => {
+        const prods = data.products.filter((p) => p.fam === fam.id);
+        if (!prods.some((p) => g.stock[p.id]))
+            return;
+        inv_rows.push(["", fam.name.toUpperCase()]);
+        prods.forEach((p) => {
+            const qty = Math.max(0, g.stock[p.id] || 0);
+            if (!qty)
+                return;
+            const cdt_ = p.cdt > 1 ? p.cdt : 1;
+            const cartons = Math.floor(qty);
+            const units = Math.round((qty - cartons) * cdt_);
+            const valeur = Math.round(p.price * qty);
+            inv_rows.push(["", p.name, p.price, cartons || "", units || "", valeur]);
+        });
+    });
+    inv_rows.push(["TOTALSTOCK", "VALEUR TOTAL DU STOCK", "", "", "", Math.round(g.stockValue)]);
+    B("");
+    B("");
+    /* -- Section LISTE DE CREANCES -- */
+    B("LISTE DE CREANCES");
+    B("");
+    inv_rows.push(["", "NOM / PDV", "CONTACTS", "DERNIERE VENTE", "DATE LIMITE PAIEMENT",
+        "CREDIT AUTORISE", "CREANCES TOTALES", "DEPASSEMENT CREDIT", "CREANCES ECHUES", "ZONE", "DELAI (j)"]);
+    const creClients = cre.filter((c) => c.solde > 0).sort((a, b) => b.solde - a.solde);
+    creClients.forEach((c) => {
+        const lastV = [...data.ventes.filter((v) => v.clientId === c.id && !v.cancelled)].sort((a, b) => b.date.localeCompare(a.date))[0];
+        const lastDate = lastV ? lastV.date : (c.debtDate || "");
+        const paiDate = lastDate ? (() => { const d = new Date(lastDate); d.setDate(d.getDate() + 14); return d.toISOString().slice(0, 10); })() : "";
+        const depassement = Math.max(0, c.solde - (c.creditLimit || 0));
+        const days = lastDate ? Math.floor((new Date(today_) - new Date(lastDate)) / 86400000) : "";
+        inv_rows.push(["", c.name, c.phone || c.contact || "", lastDate, paiDate,
+            c.creditLimit || "", Math.round(c.solde), depassement || "", c.solde, [place(c), c.canal].filter(Boolean).join(", ") || "", days]);
+    });
+    inv_rows.push(["TOTALCREANCES", "TOTAL", "", "", "",
+        creClients.reduce((a, c) => a + (c.creditLimit || 0), 0),
+        Math.round(totalCreances), "", Math.round(totalCreances), "", ""]);
+    /* ======= Feuille 2 : SALES (Ventes + Enlèvements par produit) ======= */
+    const salesRows = [["PRODUIT", "PRIX DEPOT", "PRIX VENTE", "STOCK", "ENLEVÉ", "VENDU", "SALE IN %", "SALE OUT %", "CA VENTES", "PRIME"]];
+    data.products.forEach((p) => {
+        var _a, _b;
+        const enlM = data.enlevements.filter((e) => inM(e)).reduce((a, e) => a + (+e.items[p.id] || 0), 0);
+        const venM = vM.filter((v) => !v.correctionOf).reduce((a, v) => a + (+v.items[p.id] || 0), 0);
+        const fam = data.families.find((f) => f.id === p.fam);
+        const famProds = data.products.filter((x) => x.fam === p.fam);
+        const famObj = fam ? ((_b = (_a = data.objectives[m]) === null || _a === void 0 ? void 0 : _a[fam.id]) !== null && _b !== void 0 ? _b : fam.objective) : 0;
+        const objP = famProds.length ? Math.round(famObj / famProds.length) : 0;
+        salesRows.push([p.name, p.price, p.sell, Math.max(0, g.stock[p.id] || 0),
+            enlM, venM, objP ? Math.round(enlM / objP * 100) + "%" : "",
+            objP ? Math.round(venM / objP * 100) + "%" : "", Math.round(venM * p.sell), ""]);
+    });
+    /* ======= Feuille 3 : PAR PDV ======= */
+    const pdvRows = [["PDV", "Canal", "Quartier", "Ville", "Contact", "Tél.", "Visites", "Qté", "Achats", "💵 Espèces", "📱 MoMo", "Crédit", "Remb.", "Doit", "Objectif", "%"]];
+    pr.forEach((x) => pdvRows.push([x.c.name, x.c.canal || "", x.c.quartier || "", x.c.ville || "", x.c.contact || "", x.c.phone || "", x.nb, x.qty, x.total, x.cash, x.momo, x.creditM, x.recTotal, Math.round(x.solde), x.objQ, x.objQ ? Math.round(x.qty / x.objQ * 100) + "%" : ""]));
+    /* ======= Feuille 4 : VENTES DETAIL ======= */
+    const venRows = [["Date", "Heure", "Client", "Produits", "Montant", "💵 Espèces", "📱 MoMo", "Crédit", "Remise"]];
+    const name_ = (id) => { var _a; return ((_a = data.clients.find((x) => x.id === id)) === null || _a === void 0 ? void 0 : _a.name) || "?"; };
+    vM.forEach((v) => venRows.push([v.date, v.ts ? hm(v.ts).replace(" à ", "") : "", name_(v.clientId), describe(v.items, data.products), v.total, v.cash || 0, v.momo || 0, credit(v), v.remise || ""]));
+    const xml = workbookXml([
+        { name: "INVENTAIRE " + today_, rows: inv_rows },
+        { name: "SALE IN - SALE OUT", rows: salesRows },
+        { name: "Par PDV", rows: pdvRows },
+        { name: "Ventes detail", rows: venRows },
+    ]);
+    download(xml, `INVENTAIRE_${nom.replace(/\s+/g, "_")}_${today_}.xls`, "application/vnd.ms-excel");
+}
+function _exportXlsx_old(data, m, st, cre, g) {
     const fams = data.families.map((f) => ({ f, ps: data.products.filter((p) => p.fam === f.id), s: st.fams.find((x) => x.id === f.id) })).filter((x) => x.ps.length);
     const rows = [["PRODUITS"], [""], ["OBJECTIFS"], ["RÉALISÉ"], ["%"], ["PRIME"], ["CA"]];
     const merges = [];
@@ -17541,8 +17685,8 @@ function exportXlsx(data, m, st, cre, g) {
     const pr = pdvReport(data, m);
     const xml = workbookXml([
         { name: monthLabel(m), rows, merges },
-        { name: "Par PDV", rows: [["PDV", "Quartier", "Ville", "Contact", "Visites", "Quantité", "Montant", "Espèces", "Mobile money", "Crédit du mois", "Crédit recouvré", "Solde dû", "Objectif", "% objectif"],
-                ...pr.map((x) => [x.c.name, x.c.quartier || "", x.c.ville || "", x.c.contact || "", x.nb, x.qty, x.total, x.cash, x.momo, x.creditM, x.recTotal, x.solde, x.objQ, x.objQ ? Math.round((x.qty / x.objQ) * 100) + "%" : ""])] },
+        { name: "Par PDV", rows: [["PDV", "Canal", "Quartier", "Ville", "Contact", "Visites", "Quantité", "Montant", "Espèces", "Mobile money", "Crédit du mois", "Crédit recouvré", "Solde dû", "Objectif", "% objectif"],
+                ...pr.map((x) => [x.c.name, x.c.canal || "", x.c.quartier || "", x.c.ville || "", x.c.contact || "", x.nb, x.qty, x.total, x.cash, x.momo, x.creditM, x.recTotal, x.solde, x.objQ, x.objQ ? Math.round((x.qty / x.objQ) * 100) + "%" : ""])] },
         { name: "Ventes", rows: [["Date", "Heure", "Client", "Produits", "Montant", "Espèces", "Mobile money", "Crédit", "Latitude", "Longitude", "Précision (m)", "Distance du PDV (m)"],
                 ...st.ventesM.map((v) => {
                     const cl = data.clients.find((x) => x.id === v.clientId);
@@ -17568,21 +17712,26 @@ function Sheet({ title, onClose, children, footer }) {
 const Field = ({ label, children }) => React.createElement("label", { className: "field" },
     React.createElement("span", null, label),
     children);
-const TodayField = () => React.createElement(Field, { label: "Date" },
-    React.createElement("div", { className: "today-date" },
-        "Aujourd'hui, ",
-        dayLabel(today())));
+const TodayField = () => React.createElement("div", { className: "today-line" },
+    "\uD83D\uDCC5 ",
+    React.createElement("b", null, "Aujourd'hui,"),
+    " ",
+    dayLabel(today()));
 const FutureDate = ({ label, value, onChange }) => React.createElement(Field, { label: label },
     React.createElement("input", { type: "date", min: today(), value: value, onChange: (e) => onChange(e.target.value < today() ? today() : e.target.value) }));
 const MoneyInput = ({ value, onChange, placeholder = "0" }) => React.createElement("input", { inputMode: "numeric", value: value, placeholder: placeholder, onChange: (e) => onChange(digits(e.target.value)) });
 const Seg = ({ options, value, onChange }) => (React.createElement("div", { className: "seg" }, options.map(([k, l]) => React.createElement("button", { type: "button", key: k, className: value === k ? "on" : "", onClick: () => onChange(k) }, l))));
-function Stepper({ value, onChange, bad, max }) {
+function Stepper({ value, onChange, bad, max, frac }) {
     const n = +value || 0;
     const off = max !== undefined && max <= 0;
+    const inc = (d) => { const nv = Math.round((n + d) * 4) / 4; if (nv < 0)
+        return; if (max !== undefined && nv > max)
+        return; onChange(nv > 0 ? String(nv) : ""); };
     return (React.createElement("div", { className: "stepper" + (n > 0 ? " has" : "") + (bad ? " bad" : "") + (off && !n ? " off" : "") },
-        React.createElement("button", { type: "button", "aria-label": "Moins", disabled: !n, onClick: () => onChange(n > 1 ? String(n - 1) : "") }, "\u2212"),
-        React.createElement("input", { inputMode: "numeric", value: value, placeholder: "0", disabled: off && !n, onChange: (e) => onChange(digits(e.target.value)) }),
-        React.createElement("button", { type: "button", "aria-label": "Plus", disabled: max !== undefined && n >= max, onClick: () => onChange(String(n + 1)) }, "+")));
+        React.createElement("button", { type: "button", "aria-label": "Moins", disabled: !n, onClick: () => inc(-1) }, "\u2212"),
+        React.createElement("input", { inputMode: "decimal", value: value, placeholder: "0", disabled: off && !n, onChange: (e) => { const v = e.target.value.replace(",", "."); if (/^\d*\.?\d{0,2}$/.test(v))
+                onChange(v); } }),
+        React.createElement("button", { type: "button", "aria-label": "Plus", disabled: max !== undefined && n >= max, onClick: () => inc(1) }, "+")));
 }
 function QtyGrid({ data, items, setItems, priceKey = "price", hint, stock, only }) {
     const rows = data.families.map((f) => {
@@ -17747,6 +17896,104 @@ function MoneyForm({ title, label, cta, init, withMode, onSave, onClose, childre
         React.createElement(Field, { label: "Note (facultatif)" },
             React.createElement("input", { value: note, onChange: (e) => setNote(e.target.value) }))));
 }
+const SORTIE_TYPES = [
+    { key: "casse", label: "Casse", emoji: "🔴", desc: "Produits cassés ou périmés" },
+    { key: "gratu_cli", label: "Gratuité PDV", emoji: "🎁", desc: "Offert à un client PDV" },
+    { key: "gratu_conso", label: "Gratuité consommateur", emoji: "🎁", desc: "Dégustation ou animation terrain" },
+    { key: "usage", label: "Usage interne", emoji: "📦", desc: "Consommation personnelle ou frais" },
+    { key: "retour_dep", label: "Retour dépôt", emoji: "🔄", desc: "Produits rendus au dépôt" },
+    { key: "retour_cli", label: "Retour client", emoji: "↩️", desc: "Produits récupérés chez un client" },
+];
+const sortieType = (key) => SORTIE_TYPES.find((t) => t.key === key) || SORTIE_TYPES[0];
+function SortieForm({ data, g, edit, onSave, onClose }) {
+    const [type, setType] = useState((edit === null || edit === void 0 ? void 0 : edit.type) || "casse");
+    const [clientId, setClientId] = useState((edit === null || edit === void 0 ? void 0 : edit.clientId) || "");
+    const [items, setItems] = useState((edit === null || edit === void 0 ? void 0 : edit.items) || {});
+    const [motif, setMotif] = useState((edit === null || edit === void 0 ? void 0 : edit.motif) || "");
+    const [montantRetour, setMontantRetour] = useState(String((edit === null || edit === void 0 ? void 0 : edit.montantRetour) || ""));
+    const st = sortieType(type);
+    const hasClient = ["gratu_cli", "retour_cli"].includes(type);
+    const hasRetourMontant = type === "retour_dep";
+    const qtyTotal = Object.values(items).reduce((a, v) => a + (+v || 0), 0);
+    const stockRows2 = data.products.filter((pp) => Math.max(0, g.stock[pp.id] || 0) > 0 || items[pp.id]);
+    return (React.createElement(Sheet, { title: edit ? "Modifier la sortie" : "Nouvelle sortie de stock", onClose: onClose, footer: React.createElement("button", { className: "btn primary", disabled: !qtyTotal, onClick: () => onSave({
+                id: (edit === null || edit === void 0 ? void 0 : edit.id) || uid(), date: today(), ts: new Date().toISOString(),
+                type, clientId: hasClient ? clientId : undefined,
+                items, motif, montantRetour: hasRetourMontant ? (+montantRetour || 0) : undefined
+            }) }, "Enregistrer") },
+        React.createElement(Field, { label: "Type de sortie" },
+            React.createElement("div", { className: "list" }, SORTIE_TYPES.map((t) => (React.createElement("label", { key: t.key, className: "li sortie-row" + (type === t.key ? " on" : "") },
+                React.createElement("input", { type: "radio", name: "stype", value: t.key, checked: type === t.key, onChange: () => setType(t.key), style: { display: "none" } }),
+                React.createElement("span", { style: { fontSize: 20, width: 28, textAlign: "center", flexShrink: 0 } }, t.emoji),
+                React.createElement("div", null,
+                    React.createElement("b", null, t.label),
+                    React.createElement("div", { className: "li-sub" }, t.desc))))))),
+        hasClient && React.createElement(Field, { label: "Client concern\u00E9" },
+            React.createElement("select", { value: clientId, onChange: (e) => setClientId(e.target.value) },
+                React.createElement("option", { value: "" }, "\u2014 Choisir (facultatif) \u2014"),
+                data.clients.map((c) => React.createElement("option", { key: c.id, value: c.id }, c.name)))),
+        hasRetourMontant && React.createElement(Field, { label: "Montant cr\u00E9dit\u00E9 par le d\u00E9p\u00F4t (F CFA)" },
+            React.createElement(MoneyInput, { value: montantRetour, onChange: setMontantRetour }),
+            React.createElement("p", { className: "help" }, "Si le d\u00E9p\u00F4t vous rembourse ces produits, indiquez le montant. Il sera d\u00E9duit de votre solde d\u00FB.")),
+        React.createElement(Field, { label: "Produits concern\u00E9s" },
+            stockRows2.length === 0 && React.createElement(Empty, null, "Aucun stock disponible."),
+            stockRows2.map((pp) => {
+                const sq = Math.max(0, g.stock[pp.id] || 0);
+                const cdt = pp.cdt > 1 ? pp.cdt : 0;
+                const curQty = +items[pp.id] || 0;
+                const curCtn = Math.floor(curQty);
+                const curU = cdt ? Math.round((curQty - curCtn) * cdt) : 0;
+                const setQty = (c, u) => {
+                    // Sans cdt défini : les unités sont ignorées (pas de conversion possible)
+                    const total = cdt ? +(c + u / cdt).toFixed(6) : +c;
+                    setItems((x) => ({ ...x, [pp.id]: total > 0 ? String(total) : "" }));
+                };
+                const sqFmt = fmtQty(sq, cdt);
+                const sqCtn = Math.floor(sq);
+                return (React.createElement("div", { className: "sortie-prod-row", key: pp.id },
+                    pp.img && React.createElement("img", { src: pp.img, className: "cart-img-sm", alt: pp.name }),
+                    React.createElement("div", { className: "cart-name" },
+                        React.createElement("b", null, pp.name),
+                        React.createElement("small", { className: "num" },
+                            "stock : ",
+                            sqFmt.label)),
+                    React.createElement("div", { className: "sortie-cdt-inp" },
+                        React.createElement("div", { className: "sortie-cdt-cell" },
+                            React.createElement("button", { type: "button", onClick: () => setQty(Math.max(0, curCtn - 1), curU) }, "\u2212"),
+                            React.createElement("input", { inputMode: "numeric", value: curCtn, onChange: (e) => setQty(Math.max(0, Math.min(sqCtn, +e.target.value || 0)), curU) }),
+                            React.createElement("button", { type: "button", onClick: () => curCtn < sqCtn && setQty(curCtn + 1, curU) }, "+"),
+                            React.createElement("span", null, "ctn")),
+                        React.createElement("div", { className: "sortie-cdt-cell" },
+                            React.createElement("button", { type: "button", onClick: () => setQty(curCtn, Math.max(0, curU - 1)) }, "\u2212"),
+                            React.createElement("input", { inputMode: "numeric", value: curU, onChange: (e) => setQty(curCtn, Math.max(0, Math.min(cdt ? cdt - 1 : 999, +e.target.value || 0))) }),
+                            React.createElement("button", { type: "button", onClick: () => (!cdt || curU < cdt - 1) && setQty(curCtn, curU + 1) }, "+"),
+                            React.createElement("span", { className: "muted", style: { fontSize: 11 } }, cdt ? `/${cdt}u` : "u")))));
+            })),
+        React.createElement(Field, { label: "Motif / note (facultatif)" },
+            React.createElement("input", { value: motif, onChange: (e) => setMotif(e.target.value), placeholder: st.desc + "…" }))));
+}
+const SortieItem = ({ s, data, open, g }) => {
+    var _a;
+    const st = sortieType(s.type);
+    const qtys = Object.entries(s.items || {}).filter(([, q]) => +q > 0).map(([pid, q]) => {
+        const pp = data.products.find((p) => p.id === pid);
+        const fmt = fmtQty(+q, pp === null || pp === void 0 ? void 0 : pp.cdt);
+        return `${fmt.label} ${(pp === null || pp === void 0 ? void 0 : pp.name) || "?"}`;
+    }).join(", ");
+    const cli = s.clientId ? (_a = data.clients.find((c) => c.id === s.clientId)) === null || _a === void 0 ? void 0 : _a.name : null;
+    return (React.createElement(RecItem, { rec: s, title: React.createElement(React.Fragment, null,
+            st.emoji,
+            " ",
+            st.label,
+            cli ? ` — ${cli}` : ""), sub: React.createElement(React.Fragment, null,
+            React.createElement("div", { className: "li-sub" }, qtys || "Aucun produit"),
+            s.motif && React.createElement("div", { className: "li-sub muted" }, s.motif)), amount: s.montantRetour ? React.createElement("span", { className: "ok" },
+            "+",
+            fmtN(s.montantRetour)) : null, actions: React.createElement("span", { className: "acts" },
+            !s.cancelled && React.createElement("button", { className: "btn ghost sm", onClick: () => open({ type: "editSortie", rec: s }) }, "Modifier"),
+            !s.cancelled && React.createElement("button", { className: "btn danger sm", onClick: () => open({ type: "cancel", key: "sorties", rec: s }) }, "Annuler"),
+            s.cancelled && React.createElement("span", { className: "tag red" }, "Annul\u00E9")) }));
+};
 function VersementForm({ g, edit, onSave, onClose }) {
     const dispoE = Math.max(0, g.caisse.especes), dispoM = Math.max(0, g.caisse.momo), dette = Math.max(0, g.dette);
     const [esp, setEsp] = useState((edit === null || edit === void 0 ? void 0 : edit.especes) ? String(edit.especes) : "");
@@ -17761,19 +18008,19 @@ function VersementForm({ g, edit, onSave, onClose }) {
             React.createElement("button", { className: "btn primary", disabled: !total, onClick: () => onSave({ id: (edit === null || edit === void 0 ? void 0 : edit.id) || uid(), date: edit ? edit.date : today(), amount: total, especes: e, momo: mm, note }) }, edit ? "Enregistrer la modification" : "Enregistrer le versement")) },
         React.createElement("div", { className: "strip num" },
             React.createElement("div", null,
-                React.createElement("small", null, "Esp\u00E8ces en main"),
-                fmtN(g.caisse.especes)),
+                React.createElement("small", null, "\uD83D\uDCB5 Esp\u00E8ces"),
+                React.createElement("b", { style: { color: "var(--green)" } }, fmtN(g.caisse.especes))),
             React.createElement("div", null,
-                React.createElement("small", null, "Mobile money"),
-                fmtN(g.caisse.momo)),
+                React.createElement("small", null, "\uD83D\uDCF1 MoMo"),
+                React.createElement("b", { style: { color: "var(--green)" } }, fmtN(g.caisse.momo))),
             React.createElement("div", { className: dette > 0 ? "red" : "" },
                 React.createElement("small", null, "Je dois"),
                 fmtN(dette))),
         React.createElement(TodayField, null),
         React.createElement("div", { className: "row3" },
-            React.createElement(Field, { label: "Pris dans mes esp\u00E8ces" },
+            React.createElement(Field, { label: "\uD83D\uDCB5 Pris dans mes esp\u00E8ces" },
                 React.createElement(MoneyInput, { value: esp, onChange: setEsp })),
-            React.createElement(Field, { label: "Pris sur mon mobile money" },
+            React.createElement(Field, { label: "\uD83D\uDCF1 Mobile money" },
                 React.createElement(MoneyInput, { value: momo, onChange: setMomo }))),
         React.createElement("div", { className: "chips" },
             React.createElement("button", { className: "chip", onClick: () => fill(dispoE + dispoM) }, "Tout mon argent"),
@@ -17793,6 +18040,59 @@ function VersementForm({ g, edit, onSave, onClose }) {
             " au d\u00E9p\u00F4t."),
         React.createElement(Field, { label: "Note (facultatif)" },
             React.createElement("input", { value: note, onChange: (ev) => setNote(ev.target.value), placeholder: "N\u00B0 de re\u00E7u\u2026" }))));
+}
+function MultiPicker({ data, stock, objRest, chosen, onAdd }) {
+    const [open_, setOpen_] = useState(false);
+    const [q, setQ] = useState("");
+    const [sel, setSel] = useState({});
+    const toggle = (pid) => setSel((s) => ({ ...s, [pid]: !s[pid] }));
+    const famList = data.families.map((f) => ({
+        f, prods: data.products.filter((p) => p.fam === f.id && (!q.trim() || p.name.toLowerCase().includes(q.trim().toLowerCase())))
+    })).filter((x) => x.prods.length);
+    const nbSel = Object.values(sel).filter(Boolean).length;
+    const confirm = () => {
+        const pids = Object.entries(sel).filter(([, v]) => v).map(([k]) => k);
+        if (pids.length) {
+            onAdd(pids);
+            setSel({});
+        }
+        setOpen_(false);
+        setQ("");
+    };
+    return React.createElement(React.Fragment, null,
+        React.createElement("button", { className: "btn ghost block mb", onClick: () => { setOpen_(true); setSel({}); } }, "+ Choisir plusieurs produits"),
+        open_ && React.createElement("div", { className: "mpicker" },
+            React.createElement("div", { className: "mpicker-head" },
+                React.createElement("input", { value: q, onChange: (e) => setQ(e.target.value), placeholder: "Rechercher un produit\u2026", className: "mpicker-search", autoFocus: true }),
+                React.createElement("button", { className: "btn ghost sm", onClick: () => { setOpen_(false); setQ(""); setSel({}); } }, "Annuler")),
+            React.createElement("div", { className: "mpicker-list" },
+                famList.map(({ f, prods }) => (React.createElement("div", { key: f.id },
+                    React.createElement("div", { className: "mpicker-fam" }, f.name),
+                    prods.map((pp) => {
+                        const sq = Math.max(0, stock[pp.id] || 0);
+                        const inCart = chosen.includes(pp.id);
+                        const checked = !!sel[pp.id];
+                        return (React.createElement("label", { key: pp.id, className: "mpicker-row" + (checked ? " on" : "") + (inCart ? " incart" : "") },
+                            React.createElement("input", { type: "checkbox", checked: checked, onChange: () => toggle(pp.id) }),
+                            pp.img && React.createElement("img", { src: pp.img, className: "mpicker-img", alt: pp.name }),
+                            React.createElement("div", { className: "mpicker-info" },
+                                React.createElement("span", null, pp.name),
+                                React.createElement("small", { className: "num" },
+                                    fmtN(pp.sell),
+                                    " F \u00B7 stock ",
+                                    sq,
+                                    objRest[pp.id] ? ` · obj. ${objRest[pp.id]}` : "",
+                                    inCart ? " · déjà dans le panier" : ""))));
+                    })))),
+                !famList.length && React.createElement("div", { className: "empty" }, "Aucun produit trouv\u00E9.")),
+            React.createElement("div", { className: "mpicker-foot" },
+                React.createElement("span", null,
+                    nbSel,
+                    " produit",
+                    nbSel > 1 ? "s" : "",
+                    " s\u00E9lectionn\u00E9",
+                    nbSel > 1 ? "s" : ""),
+                React.createElement("button", { className: "btn primary", disabled: !nbSel, onClick: confirm }, "Ajouter au panier"))));
 }
 function SaleForm({ data, g, init, edit, onSave, onClose }) {
     var _a;
@@ -17838,8 +18138,45 @@ function SaleForm({ data, g, init, edit, onSave, onClose }) {
     const all = clean(items);
     const over = Object.entries(all).filter(([p, q]) => q > Math.max(0, stock[p] || 0));
     const it = Object.fromEntries(Object.entries(all).filter(([p, q]) => q <= Math.max(0, stock[p] || 0)));
+    // Remises par ligne de produit : { pid: { pct: "", mnt: "" } }
+    const [lineR, setLineR] = useState({});
+    const setLR = (pid, field, val) => setLineR((lr) => ({ ...lr, [pid]: { ...(lr[pid] || {}), [field]: val } }));
+    const lineRemise = (pid, brut) => {
+        const lr = lineR[pid] || {};
+        const pct = +lr.pct || 0;
+        const mnt = +lr.mnt || 0;
+        if (pct > 0)
+            return Math.round(brut * Math.min(100, pct) / 100);
+        if (mnt > 0)
+            return Math.min(brut, mnt);
+        return 0;
+    };
+    const getRemiseCanal = (cid) => {
+        const cl = data.clients.find((c) => c.id === cid);
+        const ch = (cl === null || cl === void 0 ? void 0 : cl.canal) ? (data.canaux || []).find((x) => x.nom === cl.canal) : null;
+        if (ch && ch.remiseMode && ch.remiseMode !== "non")
+            return { pct: ch.remiseMode === "pct" ? String(ch.remisePct || "") : "", mnt: ch.remiseMode === "mnt" ? String(ch.remiseMnt || "") : "", mode: ch.remiseMode };
+        return null;
+    };
+    const ri0 = (() => { var _a; if (edit === null || edit === void 0 ? void 0 : edit.remise)
+        return { pct: edit.remiseMode === "pct" ? String(edit.remisePct || "") : "", mnt: edit.remiseMode === "mnt" ? String(edit.remise) : "", mode: edit.remiseMode || "pct" }; const r = getRemiseCanal((init === null || init === void 0 ? void 0 : init.clientId) || ((_a = data.clients[0]) === null || _a === void 0 ? void 0 : _a.id)); return r || { pct: "", mnt: "", mode: "pct" }; })();
+    const [remisePct, setRemisePct] = useState(ri0.pct);
+    const [remiseMnt, setRemiseMnt] = useState(ri0.mnt);
+    const [remiseMode, setRemiseMode] = useState(ri0.mode);
     const nb = Object.keys(it).length;
-    const total = priceSum(it, data.products, "sell");
+    // Total par ligne après remise ligne
+    const lineNets = Object.fromEntries(Object.entries(it).map(([pid, q]) => {
+        const pp = data.products.find((x) => x.id === pid);
+        const brut = ((pp === null || pp === void 0 ? void 0 : pp.sell) || 0) * q;
+        return [pid, brut - lineRemise(pid, brut)];
+    }));
+    const totalBrut = Object.values(lineNets).reduce((a, v) => a + v, 0); // somme des nets lignes
+    const totalBrutBrut = Object.entries(it).reduce((a, [pid, q]) => { const pp = data.products.find((x) => x.id === pid); return a + ((pp === null || pp === void 0 ? void 0 : pp.sell) || 0) * q; }, 0); // brut avant toute remise
+    const totalLigneRemise = totalBrutBrut - totalBrut;
+    const remise = (() => { if (remiseMode === "mnt")
+        return Math.min(totalBrut, Math.max(0, +remiseMnt || 0)); return Math.round(totalBrut * Math.min(100, Math.max(0, +remisePct || 0)) / 100); })();
+    const remisePctAff = totalBrut > 0 ? (remise / totalBrut * 100).toFixed(1).replace(".0", "") : "0";
+    const total = totalBrut - remise;
     const cashN = +cash || 0, momoN = +momo || 0, paidN = cashN + momoN;
     const trop = paidN > total;
     const cred = Math.max(0, total - paidN);
@@ -17857,7 +18194,7 @@ function SaleForm({ data, g, init, edit, onSave, onClose }) {
             cid = draft.id;
         }
         const prices = Object.fromEntries(Object.keys(it).map((p) => { var _a; return [p, ((_a = data.products.find((x) => x.id === p)) === null || _a === void 0 ? void 0 : _a.sell) || 0]; }));
-        const vente = { id: (edit === null || edit === void 0 ? void 0 : edit.id) || uid(), date, clientId: cid, items: it, prices, total, cash: cashN, momo: momoN, livraisonId: edit ? edit.livraisonId : init === null || init === void 0 ? void 0 : init.livraisonId, geo: geo || undefined };
+        const vente = { id: (edit === null || edit === void 0 ? void 0 : edit.id) || uid(), date, clientId: cid, items: it, prices, total, remise: remise || undefined, totalBrut: remise ? totalBrut : undefined, cash: cashN, momo: momoN, livraisonId: edit ? edit.livraisonId : init === null || init === void 0 ? void 0 : init.livraisonId, geo: geo || undefined };
         const rec = oldN > 0 ? { id: uid(), date, clientId: cid, amount: oldN, mode: oldMode, note: "Réglé lors d'une vente" } : null;
         onSave(vente, nc, rec);
     };
@@ -17877,22 +18214,27 @@ function SaleForm({ data, g, init, edit, onSave, onClose }) {
                 React.createElement("button", { className: "btn primary", disabled: !nb || !clientOk || over.length > 0, onClick: () => setStep("panier") },
                     React.createElement(ShoppingBag, { size: 18 }),
                     " Voir le panier")) },
-            React.createElement("div", { className: "row3" },
-                React.createElement(TodayField, null),
+            React.createElement(TodayField, null),
+            React.createElement("div", { className: "pdv-row" },
                 React.createElement(Field, { label: "Client (PDV)" },
-                    React.createElement("select", { value: clientId, onChange: (e) => { setClientId(e.target.value); if (e.target.value === "__new" && !draft)
-                            setShowNew(true); } },
+                    React.createElement("select", { value: clientId, onChange: (e) => { const cid = e.target.value; setClientId(cid); if (cid === "__new" && !draft)
+                            setShowNew(true); const r = getRemiseCanal(cid); if (r) {
+                            setRemisePct(r.pct);
+                            setRemiseMnt(r.mnt);
+                            setRemiseMode(r.mode);
+                        }
+                        else {
+                            setRemisePct("");
+                            setRemiseMnt("");
+                            setRemiseMode("pct");
+                        } } },
                         data.clients.filter((c) => matchC(c, qcli) || c.id === clientId).map((c) => React.createElement("option", { key: c.id, value: c.id },
                             c.name,
                             c.quartier ? ` (${c.quartier})` : "")),
-                        React.createElement("option", { value: "__new" }, draft ? `${draft.name} (nouveau)` : "Nouveau client…")))),
+                        React.createElement("option", { value: "__new" }, draft ? `${draft.name} (nouveau)` : "Nouveau client…"))),
+                React.createElement("button", { className: "btn ghost sm pdv-new", onClick: () => setShowNew(true) }, "\uFF0B Nouveau")),
             data.clients.length > 4 && React.createElement(Field, { label: "Rechercher un client" },
-                React.createElement("input", { value: qcli, onChange: (e) => {
-                        setQcli(e.target.value);
-                        const hit = data.clients.filter((c) => matchC(c, e.target.value));
-                        if (e.target.value.trim() && hit.length)
-                            setClientId(hit[0].id);
-                    }, placeholder: "Nom, quartier, contact\u2026" })),
+                React.createElement(ClientSearch, { clients: data.clients, qc: qcli, setQc: setQcli, onSelect: (id) => { setClientId(id); setQcli(""); }, placeholder: "Nom, quartier, contact\u2026" })),
             clientId === "__new" && React.createElement("button", { className: "btn ghost block mb", onClick: () => setShowNew(true) }, draft ? `Modifier la fiche de ${draft.name}` : "Remplir la fiche du nouveau client"),
             showNew && React.createElement(ClientForm, { init: draft, onClose: () => { var _a; setShowNew(false); if (!draft)
                     setClientId(((_a = data.clients[0]) === null || _a === void 0 ? void 0 : _a.id) || "__new"); }, onSave: (c) => { setDraft(c); setClientId("__new"); setShowNew(false); } }),
@@ -17913,26 +18255,15 @@ function SaleForm({ data, g, init, edit, onSave, onClose }) {
                     data.products.length,
                     " produits"),
                 Object.keys(objRest).length > 0 && React.createElement("button", { className: "chip", onClick: () => { const ids = Object.keys(objRest); setOrder((o) => [...new Set([...o, ...ids])]); setItems((x) => { const n = { ...x }; ids.forEach((pid) => { n[pid] = String(Math.min(objRest[pid], Math.max(0, stock[pid] || 0))); }); return n; }); } }, "Reprendre l'objectif du PDV")),
-            React.createElement(Field, { label: "Ajouter un produit" },
-                React.createElement("select", { value: "", onChange: (e) => { const pid = e.target.value; if (!pid)
-                        return; setOrder((o) => (o.includes(pid) ? o : [...o, pid])); setItems((x) => ({ ...x, [pid]: String((+x[pid] || 0) + 1) })); } },
-                    React.createElement("option", { value: "" }, "Choisir un produit\u2026"),
-                    data.families.map((f) => {
-                        const ps = data.products.filter((pp) => pp.fam === f.id);
-                        if (!ps.length)
-                            return null;
-                        return React.createElement("optgroup", { key: f.id, label: f.name }, ps.map((pp) => React.createElement("option", { key: pp.id, value: pp.id },
-                            pp.name,
-                            " \u2014 stock ",
-                            Math.max(0, stock[pp.id] || 0),
-                            objRest[pp.id] ? `, objectif ${objRest[pp.id]}` : "")));
-                    }))),
+            React.createElement(MultiPicker, { data: data, stock: stock, objRest: objRest, chosen: chosen, onAdd: (pids) => { setOrder((o) => { const n = [...o]; pids.forEach((pid) => { if (!n.includes(pid))
+                    n.push(pid); }); return n; }); setItems((x) => { const n = { ...x }; pids.forEach((pid) => { n[pid] = String((+n[pid] || 0) + 1); }); return n; }); } }),
             React.createElement("div", { className: "cart" },
                 chosen.map((pid) => {
                     const pp = data.products.find((x) => x.id === pid);
                     const sq = Math.max(0, stock[pid] || 0);
                     const q = +items[pid] || 0;
                     return React.createElement("div", { className: "cart-line", key: pid },
+                        (pp === null || pp === void 0 ? void 0 : pp.img) && React.createElement("img", { src: pp.img, className: "cart-img", alt: pp.name }),
                         React.createElement("div", { className: "cart-name" }, pp === null || pp === void 0 ? void 0 :
                             pp.name,
                             React.createElement("small", { className: "num" + (q > sq ? " red" : "") },
@@ -17947,8 +18278,21 @@ function SaleForm({ data, g, init, edit, onSave, onClose }) {
                 }),
                 !chosen.length && React.createElement("div", { className: "empty" }, "Choisissez un produit dans la liste au-dessus. Ajoutez-en autant que vous voulez."),
                 chosen.length > 0 && React.createElement("div", { className: "cart-total" },
-                    React.createElement("span", null, "Total"),
-                    React.createElement("b", { className: "num" }, fmtF(total))))));
+                    remise > 0 && React.createElement(React.Fragment, null,
+                        React.createElement("div", { className: "ct-row" },
+                            React.createElement("span", { className: "muted" }, "Sous-total"),
+                            React.createElement("span", { className: "num" }, fmtF(totalBrut))),
+                        React.createElement("div", { className: "ct-row" },
+                            React.createElement("span", { className: "muted" },
+                                "Remise (",
+                                remisePctAff,
+                                "%)"),
+                            React.createElement("span", { className: "num red" },
+                                "\u2212",
+                                fmtF(remise)))),
+                    React.createElement("div", { className: "ct-row tot" },
+                        React.createElement("span", null, "Total"),
+                        React.createElement("b", { className: "num" }, fmtF(total)))))));
     return (React.createElement(Sheet, { title: "Panier et paiement", onClose: onClose, footer: React.createElement(React.Fragment, null,
             React.createElement("div", { className: "sum" },
                 React.createElement("span", null, trop ? React.createElement("span", { className: "red" }, "Montant trop \u00E9lev\u00E9") : cred > 0 ? React.createElement("span", { className: "red" },
@@ -17964,29 +18308,90 @@ function SaleForm({ data, g, init, edit, onSave, onClose }) {
             React.createElement("div", { className: "cart-h" },
                 React.createElement("b", null, client === null || client === void 0 ? void 0 : client.name),
                 React.createElement("span", null, dayLabel(date))),
-            Object.entries(it).map(([pid, q]) => {
-                const p = data.products.find((x) => x.id === pid);
-                const s = stock[pid] || 0;
-                return (React.createElement("div", { className: "cart-line", key: pid },
-                    React.createElement("div", { className: "cart-name" }, p === null || p === void 0 ? void 0 :
-                        p.name,
-                        React.createElement("small", { className: "num" },
-                            fmtN(p === null || p === void 0 ? void 0 : p.sell),
-                            " F \u00D7 ",
-                            q,
-                            ", stock ",
-                            s)),
-                    React.createElement(Stepper, { value: items[pid] || "", max: Math.max(0, s), onChange: (v) => setQ(pid, v) }),
-                    React.createElement("b", { className: "cart-sub num" }, fmtN(((p === null || p === void 0 ? void 0 : p.sell) || 0) * q))));
-            }),
-            React.createElement("div", { className: "cart-total" },
-                React.createElement("span", null, "Total"),
-                React.createElement("b", { className: "num" }, fmtF(total)))),
+            React.createElement("div", { className: "cart-table" },
+                React.createElement("div", { className: "ct-head" },
+                    React.createElement("span", null, "Produit"),
+                    React.createElement("span", { className: "num" }, "P.U."),
+                    React.createElement("span", { className: "num" }, "Rem.%"),
+                    React.createElement("span", { className: "num" }, "Rem.F"),
+                    React.createElement("span", { className: "num" }, "Montant")),
+                Object.entries(it).map(([pid, q]) => {
+                    const pp = data.products.find((x) => x.id === pid);
+                    const sx = stock[pid] || 0;
+                    const pu = (pp === null || pp === void 0 ? void 0 : pp.sell) || 0;
+                    const brut = pu * q;
+                    const lr = lineR[pid] || {};
+                    const rLine = lineRemise(pid, brut);
+                    const net = brut - rLine;
+                    return (React.createElement("div", { className: "ct-prod", key: pid },
+                        React.createElement("div", { className: "ct-prod-top" },
+                            (pp === null || pp === void 0 ? void 0 : pp.img) && React.createElement("img", { src: pp.img, className: "cart-img-sm", alt: pp.name }),
+                            React.createElement("div", { className: "ct-prod-name" },
+                                React.createElement("b", null, pp === null || pp === void 0 ? void 0 : pp.name),
+                                React.createElement("small", { className: "num" },
+                                    "stock ",
+                                    sx)),
+                            React.createElement(Stepper, { value: items[pid] || "", max: Math.max(0, sx), onChange: (v) => setQ(pid, v) })),
+                        React.createElement("div", { className: "ct-prod-row" },
+                            React.createElement("span", { className: "num ct-pu" }, fmtN(pu)),
+                            React.createElement("div", { className: "ct-rem2" },
+                                React.createElement("input", { inputMode: "decimal", className: "ct-rem-inp", placeholder: "0%", value: lr.pct || "", onChange: (e) => {
+                                        const v = e.target.value.replace(",", ".");
+                                        if (v !== "" && !/^\d*\.?\d{0,1}$/.test(v))
+                                            return;
+                                        setLR(pid, "pct", v);
+                                        setLR(pid, "mnt", v ? String(Math.round(brut * Math.min(100, +v) / 100)) : "");
+                                    } }),
+                                React.createElement("span", { className: "ct-rem-sep" }, "|"),
+                                React.createElement("input", { inputMode: "numeric", className: "ct-rem-inp", placeholder: "0F", value: lr.mnt || "", onChange: (e) => {
+                                        const v = e.target.value.replace(/[^0-9]/g, "");
+                                        setLR(pid, "mnt", v);
+                                        setLR(pid, "pct", v && brut > 0 ? (+v / brut * 100).toFixed(1).replace(".0", "") : "");
+                                    } })),
+                            React.createElement("b", { className: "ct-mnt num" }, rLine > 0 ? React.createElement(React.Fragment, null,
+                                React.createElement("del", { className: "ct-del" }, fmtN(brut)),
+                                React.createElement("br", null),
+                                fmtN(net)) : fmtN(net)))));
+                }),
+                React.createElement("div", { className: "ct-total" },
+                    React.createElement("span", null, "Total"),
+                    (totalLigneRemise > 0 || remise > 0) && React.createElement("span", { className: "num ct-pu" },
+                        React.createElement("del", { className: "ct-del" }, fmtN(totalBrutBrut))),
+                    React.createElement("div", { className: "ct-rem2" },
+                        React.createElement("input", { inputMode: "decimal", className: "ct-rem-inp", placeholder: "0%", value: remisePct, onChange: (e) => {
+                                const v = e.target.value.replace(",", ".");
+                                if (v !== "" && !/^\d*\.?\d{0,1}$/.test(v))
+                                    return;
+                                setRemisePct(v);
+                                setRemiseMode("pct");
+                                const m = Math.round(totalBrut * Math.min(100, +v || 0) / 100);
+                                setRemiseMnt(m > 0 ? String(m) : "");
+                            } }),
+                        React.createElement("span", { className: "ct-rem-sep" }, "|"),
+                        React.createElement("input", { inputMode: "numeric", className: "ct-rem-inp", placeholder: "0F", value: remiseMnt, onChange: (e) => {
+                                const v = e.target.value.replace(/[^0-9]/g, "");
+                                setRemiseMnt(v);
+                                setRemiseMode("mnt");
+                                setRemisePct(v && totalBrut > 0 ? (+v / totalBrut * 100).toFixed(1).replace(".0", "") : "");
+                            } })),
+                    React.createElement("b", { className: "ct-mnt num" }, fmtF(total))),
+                (totalLigneRemise > 0 || remise > 0) && React.createElement("div", { className: "ct-recap" },
+                    totalLigneRemise > 0 && React.createElement("span", null,
+                        "Remises produits \u2212",
+                        fmtF(totalLigneRemise)),
+                    remise > 0 && React.createElement("span", null,
+                        "Remise totale \u2212",
+                        fmtF(remise)),
+                    React.createElement("span", null,
+                        "= ",
+                        React.createElement("b", null,
+                            "Net ",
+                            fmtF(total)))))),
         React.createElement("h3", { className: "sec" }, "Ce que le client donne"),
         React.createElement("div", { className: "row3" },
-            React.createElement(Field, { label: "En esp\u00E8ces" },
+            React.createElement(Field, { label: "\uD83D\uDCB5 En esp\u00E8ces" },
                 React.createElement(MoneyInput, { value: cash, onChange: setCash })),
-            React.createElement(Field, { label: "Par mobile money" },
+            React.createElement(Field, { label: "\uD83D\uDCF1 Mobile money" },
                 React.createElement(MoneyInput, { value: momo, onChange: setMomo }))),
         React.createElement("div", { className: "chips" },
             React.createElement("button", { className: "chip", onClick: () => { setCash(String(total)); setMomo(""); } }, "Tout en esp\u00E8ces"),
@@ -18142,7 +18547,11 @@ function receiptText(data, v, client, oldSolde) {
         L.push(`${(pp === null || pp === void 0 ? void 0 : pp.name) || "?"}  ${q} x ${fmtN(pu)} = ${fmtN(q * pu)}`);
     });
     L.push("------------------------------");
-    L.push(`TOTAL : ${fmtF(v.total)}`);
+    if (v.remise > 0) {
+        L.push(`Sous-total : ${fmtF(v.totalBrut)}`);
+        L.push(`Remise : -${fmtF(v.remise)}`);
+    }
+    L.push(`TOTAL${v.remise > 0 ? " NET" : ""} : ${fmtF(v.total)}`);
     if (v.cash)
         L.push(`Payé espèces : ${fmtF(v.cash)}`);
     if (v.momo)
@@ -18156,6 +18565,38 @@ function receiptText(data, v, client, oldSolde) {
     L.push("Merci de votre confiance.");
     return L.join("\n");
 }
+function enlText(e, data, r) {
+    const nom = (r === null || r === void 0 ? void 0 : r.name) || (r === null || r === void 0 ? void 0 : r.nom) || "Commercial";
+    const depot = (r === null || r === void 0 ? void 0 : r.depot) || "Dépôt";
+    const lines = [`📦 COMMANDE DÉPÔT - ${dayLabel(e.date)}`, `Commercial : ${nom}`, `Dépôt : ${depot}`, ""];
+    const items = Object.entries(e.items || {}).filter(([, q]) => +q > 0);
+    items.forEach(([pid, q]) => {
+        const pp = data.products.find((x) => x.id === pid);
+        if (pp) {
+            const cdt = pp.cdt > 1 ? pp.cdt : null;
+            const cartons = cdt ? Math.floor(+q) : null;
+            const units = cdt ? Math.round((+q - Math.floor(+q)) * cdt) : null;
+            const qStr = cdt
+                ? (cartons > 0 && units > 0 ? `${cartons} ctn + ${units} u` : cartons > 0 ? `${cartons} ctn` : `${units} u`)
+                : `${q} ctn`;
+            lines.push(`• ${pp.name} : ${qStr}`);
+        }
+    });
+    lines.push("");
+    lines.push(`Total : ${items.length} référence${items.length > 1 ? "s" : ""}, quantité ${items.reduce((a, [, q]) => a + Math.floor(+q), 0)} carton${items.reduce((a, [, q]) => a + Math.floor(+q), 0) > 1 ? "s" : ""}`);
+    lines.push(`Montant : ${fmtN(e.montant)} F`);
+    if (e.note)
+        lines.push(`Note : ${e.note}`);
+    return lines.join("\n");
+}
+function EnlWaBtn({ e, data, r }) {
+    const txt = enlText(e, data, r);
+    return (React.createElement("a", { className: "btn ghost sm", href: `https://wa.me/?text=${encodeURIComponent(txt)}`, target: "_blank", rel: "noopener noreferrer", style: { color: "#25D366", borderColor: "#25D366" } },
+        React.createElement("svg", { width: "15", height: "15", viewBox: "0 0 24 24", fill: "#25D366", style: { marginRight: 4, verticalAlign: "middle" } },
+            React.createElement("path", { d: "M17.47 14.38c-.28-.14-1.65-.81-1.9-.9-.26-.1-.44-.14-.63.14-.18.28-.72.9-.88 1.09-.16.18-.32.2-.6.07-.28-.14-1.17-.43-2.23-1.37-.82-.73-1.38-1.63-1.54-1.91-.16-.28-.02-.43.12-.57.12-.12.28-.32.42-.48.14-.16.18-.28.28-.46.1-.18.05-.34-.02-.48-.07-.14-.63-1.51-.86-2.07-.23-.54-.46-.47-.63-.47-.16 0-.34-.02-.52-.02-.18 0-.48.07-.73.34-.25.28-.96.94-.96 2.29s.98 2.65 1.12 2.83c.14.18 1.94 2.96 4.7 4.15.66.28 1.17.45 1.57.58.66.21 1.26.18 1.74.11.53-.08 1.65-.67 1.88-1.32.23-.65.23-1.2.16-1.32-.07-.1-.25-.17-.53-.31z" }),
+            React.createElement("path", { d: "M12 2C6.48 2 2 6.48 2 12c0 1.85.5 3.58 1.37 5.07L2 22l5.1-1.34C8.53 21.53 10.22 22 12 22c5.52 0 10-4.48 10-10S17.52 2 12 2zm0 18c-1.67 0-3.22-.47-4.55-1.28l-.32-.2-3.03.79.81-2.95-.21-.34C3.47 14.9 3 13.5 3 12c0-4.96 4.04-9 9-9s9 4.04 9 9-4.04 9-9 9z" })),
+        "WhatsApp"));
+}
 function ReceiptSheet({ data, v, onClose, toast }) {
     const client = data.clients.find((c) => c.id === v.clientId);
     const solde = client ? clientDebt(data, client.id) : 0;
@@ -18165,8 +18606,7 @@ function ReceiptSheet({ data, v, onClose, toast }) {
             const f = document.createElement("iframe");
             f.style.cssText = "position:absolute;width:0;height:0;border:0;left:-9999px";
             document.body.appendChild(f);
-            f.srcdoc = `<html><head><meta charset="utf-8"><title>Reçu</title><style>body{font:13px/1.5 monospace;padding:12px;white-space:pre-wrap}</style></head><body>${txt.replace(/&/g, "&amp;").replace(/</g, "&lt;")}<script>if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) navigator.serviceWorker.register("sw.js");</script>
-</body></html>`;
+            f.srcdoc = `<html><head><meta charset="utf-8"><title>Reçu</title><style>body{font:13px/1.5 monospace;padding:12px;white-space:pre-wrap}\x3c/style>\x3c/head><body>${txt.replace(/&/g, "&amp;").replace(/</g, "&lt;")}\x3c/body>\x3c/html>`;
             f.onload = () => { try {
                 f.contentWindow.focus();
                 f.contentWindow.print();
@@ -18219,6 +18659,15 @@ function ClientForm({ init, onSave, onClose }) {
             React.createElement("input", { value: c.contact, onChange: f("contact"), placeholder: "Ex. Tanti Awa" })),
         React.createElement(Field, { label: "T\u00E9l\u00E9phone" },
             React.createElement("input", { inputMode: "tel", value: c.phone, onChange: f("phone") })),
+        React.createElement(Field, { label: "Canal de distribution" },
+            React.createElement("select", { value: c.canal || "", onChange: (e) => setC({ ...c, canal: e.target.value }) },
+                React.createElement("option", { value: "" }, "\u2014 Choisir \u2014"),
+                ["Commerce de quartier", "Maquis / Bar", "Restaurant", "Kiosque", "Supermarché", "Grossiste", "Hôtel", "Autre"].map((opt) => React.createElement("option", { key: opt, value: opt }, opt)))),
+        React.createElement(Field, { label: "Cr\u00E9ance ant\u00E9rieure (dette avant l'application)" },
+            React.createElement("div", { className: "row3" },
+                React.createElement(MoneyInput, { value: String(c.debtInit || ""), onChange: (v) => setC({ ...c, debtInit: +digits(v) || 0 }) }),
+                React.createElement("span", { className: "help", style: { alignSelf: "center", whiteSpace: "nowrap" } }, "F CFA")),
+            React.createElement("p", { className: "help", style: { margin: "4px 0 0" } }, "Ce que ce PDV vous devait avant d'utiliser cette application. Sera inclus dans son solde d\u00FB.")),
         React.createElement(Field, { label: "Position GPS du PDV" },
             React.createElement("div", { className: "geo-card" },
                 c.geo
@@ -18785,7 +19234,9 @@ function PdvTab({ data, setData, m, st, open, del }) {
                     React.createElement("div", { className: "rec-top" },
                         React.createElement("div", { className: "li-main", onClick: () => open({ type: "client", id: c.id }) },
                             React.createElement("div", { className: "li-title" }, c.name),
-                            place(c) && React.createElement("div", { className: "li-sub" }, place(c))),
+                            (c.canal || place(c)) && React.createElement("div", { className: "li-sub" }, c.canal ? React.createElement(React.Fragment, null,
+                                React.createElement("b", null, c.canal),
+                                place(c) ? ` · ${place(c)}` : "") : place(c))),
                         React.createElement("div", { className: "li-amt num" }, tot ? React.createElement(React.Fragment, null,
                             React.createElement("span", { className: "orange" }, sd),
                             React.createElement("span", { className: "muted small-inl" },
@@ -18859,6 +19310,9 @@ function ClientSheet({ data, client, m, st, open, onClose, onSetGeo }) {
         React.createElement("div", { className: "fiche" + (debt > 0 ? " due" : "") },
             React.createElement("div", { className: "fiche-top" },
                 React.createElement("span", null,
+                    client.canal && React.createElement(React.Fragment, null,
+                        React.createElement("b", null, client.canal),
+                        React.createElement("br", null)),
                     place(client) || "Adresse non renseignée",
                     client.contact ? React.createElement(React.Fragment, null,
                         React.createElement("br", null),
@@ -18867,6 +19321,10 @@ function ClientSheet({ data, client, m, st, open, onClose, onSetGeo }) {
                 client.phone && React.createElement("a", { href: `tel:${client.phone}` },
                     "Appeler ",
                     client.phone)),
+            client.debtInit > 0 && React.createElement("p", { className: "help warn" },
+                "Cr\u00E9ance ant\u00E9rieure enregistr\u00E9e : ",
+                React.createElement("b", null, fmtF(client.debtInit)),
+                ". Incluse dans le solde d\u00FB."),
             React.createElement("div", { className: "fiche-debt" }, debt > 0 ? React.createElement(React.Fragment, null,
                 "Doit ",
                 React.createElement("b", { className: "red num" }, fmtF(debt))) : "Aucun crédit en cours")),
@@ -18919,6 +19377,30 @@ function ClientSheet({ data, client, m, st, open, onClose, onSetGeo }) {
                 React.createElement("div", { className: "li-amt" + (h.amt < 0 ? " ok" : "") }, h.amt < 0 ? "+" + fmtN(-h.amt) : fmtN(h.amt)))),
             !histSorted.length && React.createElement(Empty, null, "Aucune vente pour ce client."))));
 }
+function CanauxSettings({ data, setData }) {
+    const canaux = data.canaux || [];
+    const set = (id, k, v) => setData((d) => ({ ...d, canaux: (d.canaux || []).map((c) => (c.id === id ? { ...c, [k]: v } : c)) }));
+    const add = () => setData((d) => ({ ...d, canaux: [...(d.canaux || []), { id: uid(), nom: "Nouveau canal", remiseMode: "non", remisePct: 0, remiseMnt: 0 }] }));
+    const del_ = (id) => setData((d) => ({ ...d, canaux: (d.canaux || []).filter((c) => c.id !== id) }));
+    return React.createElement(React.Fragment, null,
+        React.createElement("p", { className: "help" }, "D\u00E9finissez vos canaux de distribution. Vous pouvez associer une remise par d\u00E9faut : elle sera propos\u00E9e automatiquement lors d'une vente \u00E0 un PDV de ce canal."),
+        canaux.length === 0 && React.createElement(Empty, null, "Aucun canal d\u00E9fini. Ajoutez-en ci-dessous."),
+        React.createElement("div", { className: "list mb" }, canaux.map((c) => (React.createElement("div", { className: "li col", key: c.id, style: { gap: 8 } },
+            React.createElement("div", { className: "rec-top" },
+                React.createElement("input", { className: "set-name", style: { flex: 1 }, value: c.nom, onChange: (e) => set(c.id, "nom", e.target.value) }),
+                React.createElement("button", { className: "del", onClick: () => del_(c.id) },
+                    React.createElement(X, { size: 16 }))),
+            React.createElement("div", { className: "row3" },
+                React.createElement(Field, { label: "Remise par d\u00E9faut" },
+                    React.createElement(Seg, { options: [["non", "Aucune"], ["pct", "En %"], ["mnt", "En F"]], value: c.remiseMode || "non", onChange: (v) => set(c.id, "remiseMode", v) })),
+                c.remiseMode === "pct" && React.createElement(Field, { label: "%" },
+                    React.createElement("input", { inputMode: "decimal", className: "obj-in wide", value: c.remisePct || "", placeholder: "0", onChange: (e) => set(c.id, "remisePct", +e.target.value || 0) })),
+                c.remiseMode === "mnt" && React.createElement(Field, { label: "F CFA" },
+                    React.createElement(MoneyInput, { value: String(c.remiseMnt || ""), onChange: (v) => set(c.id, "remiseMnt", +v || 0) }))))))),
+        React.createElement("button", { className: "btn ghost block", onClick: add },
+            React.createElement(Plus, { size: 18 }),
+            " Ajouter un canal"));
+}
 function PrimeSettings({ data, setData }) {
     const rule = { ...DEFAULT_PRIME_RULE, ...(data.primeRule || {}) };
     const setRule = (k, v) => setData((d) => ({ ...d, primeRule: { ...DEFAULT_PRIME_RULE, ...(d.primeRule || {}), [k]: v } }));
@@ -18961,13 +19443,22 @@ function SettingsSheet({ data, setData, onClose, toast, pin, setPin, initialTab 
     const num = (v) => +digits(v) || 0;
     const backup = JSON.stringify(data);
     return (React.createElement(Sheet, { title: "R\u00E9glages", onClose: onClose },
-        React.createElement(Tabs, { tabs: [["prod", "Produits et prix"], ["prime", "Primes"], ["recu", "Reçu"], ["save", "Sauvegarde"], ["secu", "Code"]], value: tab, onChange: setTab }),
+        React.createElement(Tabs, { tabs: [["prod", "Produits et prix"], ["canal", "Canaux"], ["prime", "Primes"], ["recu", "Reçu"], ["save", "Sauvegarde"], ["secu", "Code"]], value: tab, onChange: setTab }),
+        tab === "canal" && React.createElement(CanauxSettings, { data: data, setData: setData }),
         tab === "prime" && React.createElement(PrimeSettings, { data: data, setData: setData }),
         tab === "recu" && (() => {
             const r = data.receipt || {};
             const setR = (k, v2) => setData((d) => ({ ...d, receipt: { ...(d.receipt || {}), [k]: v2 } }));
             return React.createElement(React.Fragment, null,
-                React.createElement("p", { className: "help" }, "Ces informations apparaissent en haut du re\u00E7u envoy\u00E9 au client."),
+                React.createElement("p", { className: "help" }, "Ces informations apparaissent sur le re\u00E7u et dans l'export Excel (fichier Inventaire)."),
+                React.createElement("h3", { className: "sec", style: { marginTop: 4 } }, "Informations professionnelles"),
+                React.createElement(Field, { label: "Votre nom / Commercial" },
+                    React.createElement("input", { value: r.name || "", onChange: (e) => setR("name", e.target.value), placeholder: "CHR KEVIN" })),
+                React.createElement(Field, { label: "D\u00E9p\u00F4t / Entreprise" },
+                    React.createElement("input", { value: r.depot || "", onChange: (e) => setR("depot", e.target.value), placeholder: "DEPOT GAGNOA ETS EDEN" })),
+                React.createElement(Field, { label: "Chef de zone / Responsable" },
+                    React.createElement("input", { value: r.zone || "", onChange: (e) => setR("zone", e.target.value), placeholder: "M SERIBA COULIBALY" })),
+                React.createElement("h3", { className: "sec" }, "Re\u00E7u client"),
                 React.createElement(Field, { label: "Nom affich\u00E9 sur le re\u00E7u" },
                     React.createElement("input", { value: r.nom || "", onChange: (e) => setR("nom", e.target.value), placeholder: "Ex. Fabrice, distributeur" })),
                 React.createElement(Field, { label: "T\u00E9l\u00E9phone" },
@@ -18987,12 +19478,44 @@ function SettingsSheet({ data, setData, onClose, toast, pin, setPin, initialTab 
                         React.createElement(Field, { label: "Prime \u00E0 100 %" },
                             React.createElement("input", { inputMode: "numeric", value: f.prime, onChange: (e) => setFam(f.id, "prime", num(e.target.value)) })))),
                 data.products.filter((p) => p.fam === f.id).map((p) => (React.createElement("div", { className: "set-prod", key: p.id },
-                    React.createElement("input", { value: p.name, onChange: (e) => setProd(p.id, "name", e.target.value), "aria-label": "Nom du produit" }),
+                    React.createElement("div", { className: "set-prod-top" },
+                        React.createElement("label", { className: "prod-img-wrap", title: "Photo du produit \u2014 touchez pour changer" },
+                            p.img ? React.createElement("img", { src: p.img, className: "prod-img", alt: p.name }) : React.createElement("span", { className: "prod-img-ph" },
+                                React.createElement("svg", { width: "16", height: "16", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" },
+                                    React.createElement("path", { d: "M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 0 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" }),
+                                    React.createElement("circle", { cx: "12", cy: "13", r: "4" }))),
+                            React.createElement("input", { type: "file", accept: "image/*", style: { display: "none" }, onChange: (e) => {
+                                    var _a;
+                                    const f = (_a = e.target.files) === null || _a === void 0 ? void 0 : _a[0];
+                                    if (!f)
+                                        return;
+                                    const rd = new FileReader();
+                                    rd.onload = () => {
+                                        const img = new Image();
+                                        img.onload = () => {
+                                            const cv = document.createElement("canvas");
+                                            const MAX = 120;
+                                            const sc = Math.min(1, MAX / Math.max(img.width, img.height));
+                                            cv.width = Math.round(img.width * sc);
+                                            cv.height = Math.round(img.height * sc);
+                                            cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+                                            setProd(p.id, "img", cv.toDataURL("image/jpeg", 0.75));
+                                        };
+                                        img.src = String(rd.result);
+                                    };
+                                    rd.readAsDataURL(f);
+                                    e.target.value = "";
+                                } })),
+                        React.createElement("input", { value: p.name, onChange: (e) => setProd(p.id, "name", e.target.value), "aria-label": "Nom du produit", style: { flex: 1 } }),
+                        p.img && React.createElement("button", { className: "del", title: "Supprimer la photo", onClick: () => setProd(p.id, "img", "") },
+                            React.createElement(X, { size: 16 }))),
                     React.createElement("div", { className: "row3" },
                         React.createElement(Field, { label: "Prix d\u00E9p\u00F4t" },
                             React.createElement("input", { inputMode: "numeric", value: p.price, onChange: (e) => setProd(p.id, "price", num(e.target.value)) })),
                         React.createElement(Field, { label: "Prix vente" },
                             React.createElement("input", { inputMode: "numeric", value: p.sell, onChange: (e) => setProd(p.id, "sell", num(e.target.value)) })),
+                        React.createElement(Field, { label: "U/ctn" },
+                            React.createElement("input", { inputMode: "numeric", placeholder: "ex. 24", value: p.cdt || "", onChange: (e) => setProd(p.id, "cdt", +e.target.value || 0) })),
                         React.createElement(DelBtn, { onDelete: () => {
                                 var _a;
                                 const used = [...data.enlevements, ...data.ventes, ...data.plans, ...data.livraisons].some((r) => r.items && r.items[p.id])
@@ -19097,10 +19620,14 @@ const EnlItem = ({ e, data, open }) => (React.createElement(RecItem, { rec: e, t
             "Qt\u00E9 ",
             qtyOf(e.items))), sub: React.createElement("div", { className: "li-sub wrap" },
         describe(e.items, data.products),
-        e.note ? `. ${e.note}` : ""), amount: fmtN(e.montant), actions: React.createElement(RecActions, { rec: e, onEdit: () => open({ type: "editEnl", rec: e }), onCancel: () => open({ type: "cancel", key: "enlevements", rec: e }), onCorrect: () => open({ type: "corrEnl", rec: e }) }) }));
-const VersItem = ({ v, open }) => (React.createElement(RecItem, { rec: v, title: React.createElement(Stamp, { rec: v }), sub: React.createElement("div", { className: "li-sub wrap num" },
-        [v.especes && `espèces ${fmtN(v.especes)}`, v.momo && `MoMo ${fmtN(v.momo)}`].filter(Boolean).join(", "),
-        v.note ? `. ${v.note}` : ""), amount: fmtN(v.amount), actions: React.createElement(RecActions, { rec: v, onEdit: () => open({ type: "editVers", rec: v }), onCancel: () => open({ type: "cancel", key: "versements", rec: v }), onCorrect: () => open({ type: "corrVers", rec: v }) }) }));
+        e.note ? `. ${e.note}` : ""), amount: fmtN(e.montant), actions: React.createElement(React.Fragment, null,
+        React.createElement(EnlWaBtn, { e: e, data: data, r: data.receipt }),
+        React.createElement(RecActions, { rec: e, onEdit: () => open({ type: "editEnl", rec: e }), onCancel: () => open({ type: "cancel", key: "enlevements", rec: e }), onCorrect: () => open({ type: "corrEnl", rec: e }) })) }));
+const VersItem = ({ v, open }) => (React.createElement(RecItem, { rec: v, title: React.createElement(Stamp, { rec: v }), sub: React.createElement(React.Fragment, null,
+        React.createElement("div", { className: "li-sub wrap num" },
+            [v.especes && `💵 espèces ${fmtN(v.especes)}`, v.momo && `📱 MoMo ${fmtN(v.momo)}`].filter(Boolean).join(", "),
+            v.note ? `. ${v.note}` : ""),
+        v.receiptImg && React.createElement("img", { src: v.receiptImg, className: "vers-thumb", alt: "Re\u00E7u", onClick: (e) => { e.stopPropagation(); window.open(v.receiptImg, "_blank"); } })), amount: fmtN(v.amount), actions: React.createElement(RecActions, { rec: v, onEdit: () => open({ type: "editVers", rec: v }), onCancel: () => open({ type: "cancel", key: "versements", rec: v }), onCorrect: () => open({ type: "corrVers", rec: v }) }) }));
 const VenteItem = ({ v, data, open }) => (React.createElement(RecItem, { rec: v, onOpen: () => open({ type: "client", id: v.clientId }), title: React.createElement(React.Fragment, null,
         v.correctionOf ? "Retour : " : "",
         cname(data, v.clientId)), sub: React.createElement(React.Fragment, null,
@@ -19115,7 +19642,11 @@ const VenteItem = ({ v, data, open }) => (React.createElement(RecItem, { rec: v,
             [v.cash > 0 && `espèces ${fmtN(v.cash)}`, v.momo > 0 && `MoMo ${fmtN(v.momo)}`].filter(Boolean).join(", "),
             credit(v) > 0 && React.createElement("span", { className: "red" },
                 " reste d\u00FB ",
-                fmtN(credit(v)))))), amount: fmtN(v.total), extra: v.geo && React.createElement(GeoLink, { data: data, v: v }), actions: React.createElement(React.Fragment, null,
+                fmtN(credit(v)))))), amount: React.createElement(React.Fragment, null,
+        v.remise > 0 && React.createElement("small", { style: { display: "block", color: "var(--green)" } },
+            "-",
+            fmtN(v.remise)),
+        fmtN(v.total)), extra: v.geo && React.createElement(GeoLink, { data: data, v: v }), actions: React.createElement(React.Fragment, null,
         React.createElement("button", { className: "btn ghost sm", onClick: () => open({ type: "recu", v }) }, "Re\u00E7u"),
         React.createElement(RecActions, { rec: v, corrLabel: "Retour de produits", onEdit: () => open({ type: "editSale", rec: v }), onCancel: () => open({ type: "cancel", key: "ventes", rec: v }), onCorrect: () => open({ type: "retour", rec: v }) })) }));
 function periodRange(per, dateSel) {
@@ -19142,11 +19673,19 @@ function DayFilter({ data, raw, open }) {
     const enl = recent(raw.enlevements.filter(inR));
     const ven = recent(raw.ventes.filter(inR));
     const ver = recent(raw.versements.filter(inR));
+    // Créances : ventes à crédit + remboursements sur la période
+    const venCre = recent(raw.ventes.filter((v) => inR(v) && credit(v) > 0));
+    const recs = recent((data.recouvrements || []).filter(inR));
+    const creRows = data.clients.filter((c) => clientDebt(data, c.id) > 0)
+        .map((c) => ({ ...c, solde: clientDebt(data, c.id) })).sort((a, b) => b.solde - a.solde);
     const sum = (arr, k) => live(arr).reduce((acc, x) => acc + (x[k] || 0), 0);
+    const totalCre = creRows.reduce((a, c) => a + c.solde, 0);
+    const creLib = `Total dû : ${fmtF(totalCre)} · ${venCre.length ? `crédit accordé ${lib} : ${fmtF(sum(venCre.filter((v) => !v.correctionOf), "total") > 0 ? venCre.filter((v) => !v.correctionOf).reduce((a, v) => a + credit(v), 0) : 0)} · ` : ""}${recs.length ? `encaissé ${lib} : ${fmtF(sum(recs, "amount"))}` : ""}`;
     const F = {
         enl: { label: "Enlèvements", Icon: Truck, list: enl, total: `Enlevé ${lib} : ${fmtF(sum(enl, "montant"))}`, empty: `Aucun enlèvement ${lib}.` },
         vente: { label: "Ventes", Icon: ShoppingBag, list: ven, total: `Vendu ${lib} : ${fmtF(sum(ven, "total"))}, encaissé ${fmtF(sum(ven, "cash") + sum(ven, "momo"))}`, empty: `Aucune vente ${lib}.` },
         vers: { label: "Versements", Icon: Wallet, list: ver, total: `Versé ${lib} : ${fmtF(sum(ver, "amount"))}`, empty: `Aucun versement ${lib}.` },
+        cre: { label: "Créances", Icon: Wallet, list: [...venCre, ...recs], total: creLib, empty: "Aucun mouvement de crédit." },
     };
     const cur = F[f];
     return React.createElement(React.Fragment, null,
@@ -19163,7 +19702,21 @@ function DayFilter({ data, raw, open }) {
             f === "enl" && enl.map((e) => React.createElement(EnlItem, { key: e.id, e: e, data: data, open: open })),
             f === "vente" && ven.map((v) => React.createElement(VenteItem, { key: v.id, v: v, data: data, open: open })),
             f === "vers" && ver.map((v) => React.createElement(VersItem, { key: v.id, v: v, open: open })),
-            !cur.list.length && React.createElement(Empty, null, cur.empty)));
+            f === "cre" && React.createElement(React.Fragment, null,
+                creRows.length > 0 && React.createElement("div", { className: "payrecap num mb" },
+                    creRows.map((c) => React.createElement("div", { key: c.id },
+                        React.createElement("span", null, c.name),
+                        React.createElement("b", { className: "red" }, fmtN(c.solde)))),
+                    React.createElement("div", { className: "rest due" },
+                        React.createElement("span", null, "Total d\u00FB"),
+                        React.createElement("b", null, fmtN(totalCre)))),
+                venCre.map((v) => React.createElement(VenteItem, { key: v.id, v: v, data: data, open: open })),
+                recs.map((r) => React.createElement(VersItem, { key: r.id, v: r, open: open })),
+                !venCre.length && !recs.length && React.createElement(Empty, null,
+                    "Aucun mouvement de cr\u00E9dit ",
+                    lib,
+                    ".")),
+            !cur.list.length && f !== "cre" && React.createElement(Empty, null, cur.empty)));
 }
 /* Objectif du jour et de la semaine, calculés à partir de ce qui reste de l'objectif du mois */
 function periodGoals(data, st, m, per, dateSel) {
@@ -19241,12 +19794,12 @@ function Dashboard({ data, raw, m, st, g, cre, open, hasPin, folds, setFolds }) 
                     " doi",
                     cre.length > 1 ? "vent" : "t")),
             React.createElement("div", { className: "kpi" },
-                React.createElement("small", null, "Esp\u00E8ces disponibles"),
-                React.createElement("b", null, fmtF(g.caisse.especes + g.caisse.momo)),
+                React.createElement("small", null, "\uD83D\uDCB5 Esp\u00E8ces disponibles"),
+                React.createElement("b", { style: { color: "var(--green)" } }, fmtF(g.caisse.especes + g.caisse.momo)),
                 React.createElement("em", null,
-                    "Esp\u00E8ces ",
+                    "\uD83D\uDCB5 ",
                     fmtN(g.caisse.especes),
-                    ", MoMo ",
+                    " \u00B7 \uD83D\uDCF1 ",
                     fmtN(g.caisse.momo))),
             React.createElement("div", { className: "kpi " + (inventaire < -0.5 ? "red" : "okv") },
                 React.createElement("small", null, "R\u00E9sultat inventaire"),
@@ -19277,7 +19830,7 @@ function Dashboard({ data, raw, m, st, g, cre, open, hasPin, folds, setFolds }) 
             livToday.length > 0 && React.createElement("div", { className: "list" },
                 React.createElement(LivList, { data: data, livs: livToday.slice(0, 8), open: open })),
             !faire && React.createElement(Empty, null, "Rien en attente pour aujourd'hui.")),
-        React.createElement(Fold, { id: "activite", title: "Activit\u00E9", summary: `Aujourd'hui : enlevé ${fmtN(liveT(raw.enlevements, "montant"))}, vendu ${fmtN(liveT(raw.ventes, "total"))}`, ...fp },
+        React.createElement(Fold, { id: "activite", title: "Activit\u00E9", summary: `Aujourd'hui : enlevé ${fmtN(liveT(raw.enlevements, "montant"))}, vendu ${fmtN(liveT(raw.ventes, "total"))}, dû ${fmtN(data.clients.reduce((a, c) => a + Math.max(0, clientDebt(data, c.id)), 0))}`, ...fp },
             React.createElement(DayFilter, { data: data, raw: raw, open: open })),
         React.createElement(Fold, { id: "realise", title: "R\u00E9alis\u00E9", summary: `Ce mois : ${totReal} / ${totObj}, soit ${totObj ? Math.round((totReal / totObj) * 100) : 0} %`, ...fp },
             React.createElement("div", { className: "tabs" }, [["jour", "Aujourd'hui"], ["semaine", "Cette semaine"], ["mois", "Ce mois"], ["date", "Choisir une date"]].filter(([k]) => inMonth || k === "mois" || k === "date").map(([k, l]) => React.createElement("button", { key: k, className: gper === k ? "on" : "", onClick: () => setGper(k) }, l))),
@@ -19311,8 +19864,24 @@ function Depot({ data, raw, m, st, g, open, folds, setFolds }) {
             React.createElement("div", { className: st.soldeFin > 0 ? "red" : "" },
                 React.createElement("small", null, "Solde d\u00FB"),
                 fmtN(st.soldeFin))),
-        React.createElement("button", { className: "btn ghost block mb", onClick: () => open({ type: "depart" }) }, data.depart ? `Point de départ du ${dayLabel(data.depart.date)} : modifier` : "Renseigner mon point de départ (solde, stock, caisse)"),
-        React.createElement(Tabs, { tabs: [["enl", "Enlèvements"], ["ver", "Versements"], ["stock", "Stock"]], value: tab, onChange: setTab }),
+        React.createElement("div", { className: "fiche" },
+            React.createElement("div", { className: "rec-top" },
+                React.createElement("div", { className: "li-main" }, data.depart
+                    ? React.createElement(React.Fragment, null,
+                        React.createElement("b", null, "Point de d\u00E9part"),
+                        React.createElement("div", { className: "li-sub" },
+                            "Du ",
+                            dayLabel(data.depart.date),
+                            " \u2014 d\u00E9p\u00F4t ",
+                            fmtN(Math.abs(data.depart.solde || 0)),
+                            " F, esp\u00E8ces ",
+                            fmtN(data.depart.especes || 0),
+                            " F"))
+                    : React.createElement(React.Fragment, null,
+                        React.createElement("b", null, "Point de d\u00E9part non renseign\u00E9"),
+                        React.createElement("div", { className: "li-sub" }, "Solde d\u00E9p\u00F4t, argent en main et stock avant l'application"))),
+                React.createElement("button", { className: "btn ghost sm", onClick: () => open({ type: "depart" }) }, data.depart ? "Modifier" : "Renseigner"))),
+        React.createElement(Tabs, { tabs: [["enl", "Enlèvements"], ["ver", "Versements"], ["stock", "Stock"], ["sorties", "Sorties"], ["caisse", "Caisse"]], value: tab, onChange: setTab }),
         tab === "enl" && React.createElement(React.Fragment, null,
             React.createElement("button", { className: "btn primary block mb", onClick: () => open({ type: "real" }) },
                 React.createElement(Plus, { size: 18 }),
@@ -19346,12 +19915,33 @@ function Depot({ data, raw, m, st, g, open, folds, setFolds }) {
         tab === "stock" && (React.createElement(Fold, { id: "dep-stock", title: "Stock", badge: stockRows.length || null, summary: `Valeur ${fmtF(g.stockValue)}`, ...fp },
             React.createElement("p", { className: "help" }, "Stock = point de d\u00E9part + enl\u00E8vements \u2212 ventes."),
             React.createElement("div", { className: "list" },
-                stockRows.map((p) => (React.createElement("div", { className: "li", key: p.id },
-                    React.createElement("div", { className: "li-main" },
-                        React.createElement("div", { className: "li-title" }, p.name),
-                        React.createElement("div", { className: "li-sub num" }, fmtF(g.stock[p.id] * p.price))),
-                    React.createElement("div", { className: "li-amt" + (g.stock[p.id] < 0 ? " red" : "") }, g.stock[p.id])))),
-                !stockRows.length && React.createElement(Empty, null, "Stock vide. Il se remplit avec vos enl\u00E8vements.")))));
+                stockRows.map((p) => {
+                    const q = fmtQty(g.stock[p.id], p.cdt);
+                    return (React.createElement("div", { className: "li", key: p.id },
+                        p.img && React.createElement("img", { src: p.img, className: "cart-img-sm", alt: p.name }),
+                        React.createElement("div", { className: "li-main" },
+                            React.createElement("div", { className: "li-title" }, p.name),
+                            React.createElement("div", { className: "li-sub num" }, fmtF(g.stock[p.id] * p.price))),
+                        React.createElement("div", { className: "li-stock-r" }, p.cdt > 1 ? (() => {
+                            const q = fmtQty(g.stock[p.id], p.cdt);
+                            return React.createElement("div", { className: "li-ctn-display" },
+                                React.createElement("div", { className: "li-ctn-big" },
+                                    q.ctn,
+                                    React.createElement("small", null, "ctn")),
+                                React.createElement("div", { className: "li-ctn-u" + (q.u === 0 ? " op30" : "") },
+                                    q.u,
+                                    React.createElement("small", null, "u")));
+                        })() : React.createElement("div", { className: "li-amt" + (g.stock[p.id] < 0 ? " red" : "") },
+                            Number.isInteger(g.stock[p.id]) ? g.stock[p.id] : g.stock[p.id].toFixed(2).replace(".", ","),
+                            React.createElement("small", { className: "li-unit" }, " ctn")))));
+                }),
+                !stockRows.length && React.createElement(Empty, null, "Stock vide. Il se remplit avec vos enl\u00E8vements.")))),
+        tab === "sorties" && React.createElement(React.Fragment, null,
+            React.createElement("button", { className: "btn primary block mb", onClick: () => open({ type: "sortie" }) }, "+ Nouvelle sortie / retour"),
+            React.createElement(Fold, { id: "dep-sorties", title: "Sorties de stock", badge: (data.sorties || []).filter((x) => !x.cancelled).length || null, summary: `${(data.sorties || []).filter((x) => !x.cancelled).length} sortie${(data.sorties || []).filter((x) => !x.cancelled).length > 1 ? "s" : ""} enregistrée${(data.sorties || []).filter((x) => !x.cancelled).length > 1 ? "s" : ""}`, ...fp },
+                React.createElement("div", { className: "list" },
+                    recent((data.sorties || [])).map((x) => React.createElement(SortieItem, { key: x.id, s: x, data: data, g: g, open: open })),
+                    !(data.sorties || []).length && React.createElement(Empty, null, "Aucune sortie enregistr\u00E9e.")))));
 }
 /* Filtre de période commun : jour, semaine, mois (celui affiché en haut), période libre */
 function usePeriod(m, def = "jour") {
@@ -19391,8 +19981,13 @@ function Ventes({ data, raw, m, st, g, cre, open, del, folds, setFolds }) {
     const creRows = data.clients.map((c) => {
         const pris = data.ventes.filter((v) => v.clientId === c.id && pc.inR(v)).reduce((a, v) => a + credit(v), 0);
         const remb = data.recouvrements.filter((r) => r.clientId === c.id && pc.inR(r)).reduce((a, r) => a + r.amount, 0);
-        return { ...c, pris, remb, solde: clientDebt(data, c.id) };
-    }).filter((c) => c.pris || c.remb).sort((a, b) => b.solde - a.solde);
+        const solde = clientDebt(data, c.id);
+        const firstV = [...data.ventes.filter((v) => v.clientId === c.id && credit(v) > 0 && !v.cancelled)].sort((a, b) => a.date.localeCompare(b.date))[0];
+        const dateRef = c.debtDate || (firstV === null || firstV === void 0 ? void 0 : firstV.date);
+        const days = dateRef ? Math.floor((new Date(today()) - new Date(dateRef)) / 86400000) : null;
+        return { ...c, pris, remb, solde, dateRef, days };
+        // Inclure : mouvement dans la période OU créance initiale non soldée (hors filtre période)
+    }).filter((c) => c.pris || c.remb || (c.debtInit > 0 && c.solde > 0)).sort((a, b) => b.solde - a.solde);
     const moves = [
         ...data.ventes.filter(pk.inR).flatMap((v) => [v.cash && { id: v.id + "c", date: v.date, ts: v.ts, label: `${v.cash < 0 ? "Remboursement" : "Vente"} ${cname(data, v.clientId)}`, prod: describe(v.items, data.products), mode: "especes", amt: v.cash }, v.momo && { id: v.id + "m", date: v.date, ts: v.ts, label: `Vente ${cname(data, v.clientId)}`, prod: describe(v.items, data.products), mode: "momo", amt: v.momo }].filter(Boolean)),
         ...data.recouvrements.filter(pk.inR).map((r) => ({ id: r.id, date: r.date, ts: r.ts, label: `Crédit réglé par ${cname(data, r.clientId)}`, mode: r.mode, amt: r.amount })),
@@ -19405,10 +20000,10 @@ function Ventes({ data, raw, m, st, g, cre, open, del, folds, setFolds }) {
     return React.createElement(React.Fragment, null,
         React.createElement("div", { className: "strip num" },
             React.createElement("div", null,
-                React.createElement("small", null, "Esp\u00E8ces"),
+                React.createElement("small", null, "\uD83D\uDCB5 Esp\u00E8ces"),
                 fmtN(g.caisse.especes)),
             React.createElement("div", null,
-                React.createElement("small", null, "Mobile money"),
+                React.createElement("small", null, "\uD83D\uDCF1 MoMo"),
                 fmtN(g.caisse.momo)),
             React.createElement("div", { className: creTotal > 0 ? "red" : "" },
                 React.createElement("small", null, "Cr\u00E9ances"),
@@ -19453,24 +20048,34 @@ function Ventes({ data, raw, m, st, g, cre, open, del, folds, setFolds }) {
                     fmtF(creTotal),
                     "."),
                 React.createElement("div", { className: "list" },
-                    creRows.map((c) => (React.createElement("div", { className: "li", key: c.id },
+                    creRows.filter((c) => c.solde > 0).map((c) => (React.createElement("div", { className: "li", key: c.id },
                         React.createElement("div", { className: "li-main", onClick: () => open({ type: "client", id: c.id }) },
                             React.createElement("div", { className: "li-title" }, c.name),
-                            React.createElement("div", { className: "li-sub num" }, [c.pris && `crédit pris ${fmtN(c.pris)}`, c.remb && `remboursé ${fmtN(c.remb)}`].filter(Boolean).join(", "))),
+                            c.debtInit > 0 && c.pris === 0 && React.createElement("div", { className: "li-sub num", style: { color: "var(--orange)", fontWeight: 600 } },
+                                "Cr\u00E9ance initiale ",
+                                fmtF(c.debtInit),
+                                c.debtDate ? ` · enregistrée le ${dayLabel(c.debtDate)}` : "",
+                                c.days !== null ? ` · il y a ${c.days} j` : ""),
+                            (c.pris > 0 || c.remb > 0) && React.createElement("div", { className: "li-sub num" }, [c.pris && `crédit ${pc.lib} ${fmtN(c.pris)}`, c.remb && `remb. ${fmtN(c.remb)}`].filter(Boolean).join(", ")),
+                            c.solde > 0 && c.days !== null && !(c.debtInit > 0 && c.pris === 0) && React.createElement("div", { className: "li-sub num" },
+                                "Depuis ",
+                                c.days,
+                                " j (",
+                                dayLabel(c.dateRef),
+                                ")")),
                         React.createElement("div", { className: "li-amt " + (c.solde > 0 ? "red" : "ok") }, c.solde > 0 ? fmtN(c.solde) : "soldé"),
-                        c.solde > 0 && React.createElement("button", { className: "btn amber sm", onClick: () => open({ type: "rec", client: c }) }, "Encaisser")))),
-                    !creRows.length && React.createElement(Empty, null,
-                        "Aucun mouvement de cr\u00E9dit ",
+                        c.solde > 0 && React.createElement("button", { className: "btn amber sm", style: { marginTop: 4 }, onClick: () => open({ type: "rec", client: c }) }, "Encaisser")))),
+                    !creRows.filter((c) => c.solde > 0).length && React.createElement(Empty, null,
+                        "Aucune cr\u00E9ance en cours ",
                         pc.lib,
                         ".")))),
         tab === "cli" && React.createElement(React.Fragment, null,
             React.createElement("button", { className: "btn primary block mb", onClick: () => open({ type: "clientNew" }) },
                 React.createElement(Plus, { size: 18 }),
                 " Nouveau client"),
-            React.createElement(Field, { label: "Rechercher un client" },
-                React.createElement("input", { value: qc, onChange: (e) => setQc(e.target.value), placeholder: "Nom, quartier, contact, t\u00E9l\u00E9phone\u2026" })),
             React.createElement(PeriodBar, { p: pcl }),
             React.createElement(Fold, { id: "v-cli", title: "Clients", badge: data.clients.length || null, summary: `${cliRows.filter((x) => x.nb).length} actif${cliRows.filter((x) => x.nb).length > 1 ? "s" : ""} ${pcl.lib}`, ...fp },
+                React.createElement(ClientSearch, { clients: data.clients, onSelect: (id) => { setQc(""); open({ type: "client", id }); }, qc: qc, setQc: setQc }),
                 React.createElement("p", { className: "help num" },
                     cliRows.filter((x) => x.nb).length,
                     " client",
@@ -19489,7 +20094,16 @@ function Ventes({ data, raw, m, st, g, cre, open, del, folds, setFolds }) {
                         React.createElement("div", { className: "rec-top" },
                             React.createElement("div", { className: "li-main", onClick: () => open({ type: "client", id: c.id }) },
                                 React.createElement("div", { className: "li-title" }, c.name),
-                                React.createElement("div", { className: "li-sub wrap" }, [place(c), c.contact].filter(Boolean).join(". ") || "Voir la fiche"),
+                                React.createElement("div", { className: "li-sub wrap" },
+                                    [c.canal, place(c)].filter(Boolean).join(" · "),
+                                    c.contact && React.createElement("span", null,
+                                        " \u00B7 ",
+                                        c.contact),
+                                    c.phone && React.createElement(React.Fragment, null,
+                                        " \u00B7 ",
+                                        React.createElement("a", { className: "tel-link", href: `tel:${c.phone.replace(/[^0-9+]/g, "")}`, onClick: (e) => e.stopPropagation() },
+                                            "\uD83D\uDCDE ",
+                                            c.phone))),
                                 React.createElement("div", { className: "li-sub wrap" }, c.geo
                                     ? React.createElement("a", { className: "maplink", href: mapUrl(c.geo), target: "_blank", rel: "noopener noreferrer", onClick: (e) => e.stopPropagation() }, "Position GPS enregistr\u00E9e")
                                     : React.createElement("span", { className: "orange" }, "Sans position GPS")),
@@ -19641,6 +20255,8 @@ function Rapport({ data, m, st, g, cre, toast }) {
     const [tab, setTab] = useState("syn");
     const [onlyActive, setOnlyActive] = useState(true);
     const [pdvSel, setPdvSel] = useState(null);
+    const [pdvFlt, setPdvFlt] = useState("");
+    const [jourFlt, setJourFlt] = useState("");
     const prods = data.products.filter((p) => st.real[p.id]);
     const days = [];
     let solde = st.soldeAvant;
@@ -19678,27 +20294,48 @@ function Rapport({ data, m, st, g, cre, toast }) {
                 React.createElement("table", { className: "rep" },
                     React.createElement("thead", null,
                         React.createElement("tr", null,
-                            React.createElement("th", null, "Famille"),
-                            React.createElement("th", null, "Objectif"),
-                            React.createElement("th", null, "R\u00E9alis\u00E9"),
-                            React.createElement("th", null, "%"),
-                            React.createElement("th", null, "Prime"),
-                            React.createElement("th", null, "CA"))),
+                            React.createElement("th", null, "Produit"),
+                            React.createElement("th", null, "Obj."),
+                            React.createElement("th", null, "Enlev\u00E9"),
+                            React.createElement("th", null, "%SI"),
+                            React.createElement("th", { className: "ok" }, "Vendu"),
+                            React.createElement("th", { className: "ok" }, "%SO"),
+                            React.createElement("th", { className: "ok" }, "CA"))),
                     React.createElement("tbody", null,
-                        st.fams.map((f) => React.createElement("tr", { key: f.id },
-                            React.createElement("td", null, f.name),
-                            React.createElement("td", null, f.obj),
-                            React.createElement("td", null, f.real),
-                            React.createElement("td", { className: f.pct >= 1 ? "ok" : "" }, Math.round(f.pct * 100)),
-                            React.createElement("td", null, fmtN(f.prime)),
-                            React.createElement("td", null, fmtN(f.ca)))),
-                        React.createElement("tr", { className: "tot" },
-                            React.createElement("td", null, "Total"),
-                            React.createElement("td", null, tot("obj")),
-                            React.createElement("td", null, tot("real")),
-                            React.createElement("td", null, tot("obj") ? Math.round((tot("real") / tot("obj")) * 100) : 0),
-                            React.createElement("td", null, fmtN(st.primeTotal)),
-                            React.createElement("td", null, fmtN(tot("ca"))))))),
+                        data.products.map((p) => {
+                            var _a, _b;
+                            const enlM = data.enlevements.filter((e) => e.date.slice(0, 7) === m).reduce((a, e) => a + (+e.items[p.id] || 0), 0);
+                            const venM = data.ventes.filter((v) => v.date.slice(0, 7) === m && !v.cancelled && !v.correctionOf).reduce((a, v) => a + (+v.items[p.id] || 0), 0);
+                            if (!enlM && !venM)
+                                return null;
+                            const fam = data.families.find((f) => f.id === p.fam);
+                            const famProds = data.products.filter((x) => x.fam === p.fam);
+                            const famObj = fam ? ((_b = (_a = data.objectives[m]) === null || _a === void 0 ? void 0 : _a[fam.id]) !== null && _b !== void 0 ? _b : fam.objective) : 0;
+                            const objP = famProds.length ? Math.round(famObj / famProds.length) : 0;
+                            const pSI = objP ? Math.round(enlM / objP * 100) : null;
+                            const pSO = objP ? Math.round(venM / objP * 100) : null;
+                            return React.createElement("tr", { key: p.id },
+                                React.createElement("td", { style: { fontWeight: 500 } }, p.name),
+                                React.createElement("td", null, objP || ""),
+                                React.createElement("td", null, enlM),
+                                React.createElement("td", { className: pSI >= 100 ? "ok" : "" }, pSI !== null ? pSI + "%" : ""),
+                                React.createElement("td", { className: "ok", style: { fontWeight: 700 } }, venM),
+                                React.createElement("td", { className: "ok" }, pSO !== null ? pSO + "%" : ""),
+                                React.createElement("td", { className: "ok", style: { fontWeight: 700 } }, venM * p.sell ? fmtN(venM * p.sell) : ""));
+                        }),
+                        (() => {
+                            const tE = data.enlevements.filter((e) => e.date.slice(0, 7) === m).reduce((a, e) => a + Object.values(e.items).reduce((s, v) => s + (+v), 0), 0);
+                            const tV = data.ventes.filter((v) => v.date.slice(0, 7) === m && !v.cancelled && !v.correctionOf).reduce((a, v) => a + Object.values(v.items).reduce((s, q) => s + (+q), 0), 0);
+                            const tCA = data.ventes.filter((v) => v.date.slice(0, 7) === m && !v.cancelled && !v.correctionOf).reduce((a, v) => a + v.total, 0);
+                            return React.createElement("tr", { className: "tot" },
+                                React.createElement("td", null, "Total"),
+                                React.createElement("td", null),
+                                React.createElement("td", null, tE),
+                                React.createElement("td", null),
+                                React.createElement("td", { className: "ok" }, tV),
+                                React.createElement("td", null),
+                                React.createElement("td", { className: "ok" }, fmtN(tCA)));
+                        })()))),
             React.createElement("h3", { className: "sec" }, "D\u00E9p\u00F4t"),
             React.createElement("div", { className: "list mb" }, [["Solde reporté", st.soldeAvant], ["Total facture (enlèvements)", st.facture], ["Versements au dépôt", -st.verse], ["Reste à verser", st.soldeFin, "red"]].map(([l, v, cls]) => (React.createElement("div", { className: "li", key: l },
                 React.createElement("div", { className: "li-main" }, l),
@@ -19709,109 +20346,159 @@ function Rapport({ data, m, st, g, cre, toast }) {
                 React.createElement("div", { className: "li-main" }, l),
                 React.createElement("div", { className: "li-amt " + (cls && v > 0 ? cls : "") }, fmtN(v))))))),
         tab === "pdv" && React.createElement(React.Fragment, null,
-            React.createElement("p", { className: "help" }, "Touchez un PDV pour tout son d\u00E9tail du mois."),
-            React.createElement("div", { className: "scroll mb" },
-                React.createElement("table", { className: "rep" },
-                    React.createElement("thead", null,
-                        React.createElement("tr", null,
-                            React.createElement("th", null, "PDV"),
-                            React.createElement("th", null, "Visites"),
-                            React.createElement("th", null, "Qt\u00E9"),
-                            React.createElement("th", null, "Achats"),
-                            React.createElement("th", null, "Esp\u00E8ces"),
-                            React.createElement("th", null, "MoMo"),
-                            React.createElement("th", null, "Cr\u00E9dit"),
-                            React.createElement("th", null, "Remb."),
-                            React.createElement("th", null, "Doit"),
-                            React.createElement("th", null, "Obj."),
-                            React.createElement("th", null, "%"))),
-                    React.createElement("tbody", null,
-                        pr.map((x) => React.createElement("tr", { key: x.c.id, className: "rowlink", onClick: () => setPdvSel(x) },
-                            React.createElement("td", null, x.c.name),
-                            React.createElement("td", null, x.nb || ""),
-                            React.createElement("td", null, x.qty || ""),
-                            React.createElement("td", null, x.total ? fmtN(x.total) : ""),
-                            React.createElement("td", null, x.cash ? fmtN(x.cash) : ""),
-                            React.createElement("td", null, x.momo ? fmtN(x.momo) : ""),
-                            React.createElement("td", null, x.creditM > 0 ? fmtN(x.creditM) : ""),
-                            React.createElement("td", null, x.recTotal ? fmtN(x.recTotal) : ""),
-                            React.createElement("td", { className: x.solde > 0 ? "red" : "" }, x.solde > 0 ? fmtN(x.solde) : ""),
-                            React.createElement("td", null, x.objQ || ""),
-                            React.createElement("td", { className: x.objQ && x.qty >= x.objQ ? "ok" : "" }, x.objQ ? Math.round((x.qty / x.objQ) * 100) : ""))),
-                        pr.length > 0 && (() => {
-                            const S = (k) => pr.reduce((a, x) => a + (x[k] || 0), 0);
-                            const oq = S("objQ"), q = S("qty");
-                            return React.createElement("tr", { className: "tot" },
-                                React.createElement("td", null, "Total"),
-                                React.createElement("td", null, S("nb")),
-                                React.createElement("td", null, q),
-                                React.createElement("td", null, fmtN(S("total"))),
-                                React.createElement("td", null, fmtN(S("cash"))),
-                                React.createElement("td", null, fmtN(S("momo"))),
-                                React.createElement("td", null, fmtN(pr.reduce((a, x) => a + Math.max(0, x.creditM), 0))),
-                                React.createElement("td", null, fmtN(S("recTotal"))),
-                                React.createElement("td", null, fmtN(pr.reduce((a, x) => a + Math.max(0, x.solde), 0))),
-                                React.createElement("td", null, oq),
-                                React.createElement("td", null, oq ? Math.round((q / oq) * 100) : ""));
-                        })()))),
-            !pr.length && React.createElement(Empty, null, "Aucun PDV enregistr\u00E9."),
-            pdvSel && React.createElement(PdvReportSheet, { data: data, x: pdvSel, m: m, onClose: () => setPdvSel(null) })),
+            React.createElement("p", { className: "help" }, "Touchez un PDV pour son d\u00E9tail complet."),
+            (() => {
+                const [qPdv, setQPdv] = [pdvFlt, setPdvFlt];
+                const prF = pr.filter((x) => !qPdv || x.c.name.toLowerCase().includes(qPdv.toLowerCase()) || [place(x.c), x.c.canal].join(" ").toLowerCase().includes(qPdv.toLowerCase()));
+                const venProds = data.products.filter((p) => pr.some((x) => x.items[p.id]));
+                const S = (k) => prF.reduce((a, x) => a + (x[k] || 0), 0);
+                const oq = S("objQ"), q = S("qty");
+                return React.createElement(React.Fragment, null,
+                    React.createElement("input", { className: "rep-search", value: qPdv, onChange: (e) => setPdvFlt(e.target.value), placeholder: "\uD83D\uDD0D Filtrer par PDV, canal, lieu\u2026" }),
+                    React.createElement("div", { className: "scroll mb" },
+                        React.createElement("table", { className: "rep" },
+                            React.createElement("thead", null,
+                                React.createElement("tr", null,
+                                    React.createElement("th", null, "PDV"),
+                                    React.createElement("th", null, "Canal"),
+                                    React.createElement("th", null, "Visites"),
+                                    venProds.map((p) => React.createElement("th", { key: p.id, className: "pname ok" }, p.name)),
+                                    React.createElement("th", null, "Total qt\u00E9"),
+                                    React.createElement("th", null, "Achats"),
+                                    React.createElement("th", { className: "ok" }, "\uD83D\uDCB5"),
+                                    React.createElement("th", { className: "ok" }, "\uD83D\uDCF1"),
+                                    React.createElement("th", null, "Cr\u00E9dit"),
+                                    React.createElement("th", null, "Remb."),
+                                    React.createElement("th", { className: "red" }, "Doit"),
+                                    React.createElement("th", null, "Obj."),
+                                    React.createElement("th", null, "%"))),
+                            React.createElement("tbody", null,
+                                prF.filter((x) => x.nb || x.solde > 0).map((x) => (React.createElement("tr", { key: x.c.id, className: "rowlink", onClick: () => setPdvSel(x) },
+                                    React.createElement("td", { style: { fontWeight: 600 } }, x.c.name),
+                                    React.createElement("td", null, x.c.canal || ""),
+                                    React.createElement("td", null, x.nb || ""),
+                                    venProds.map((p) => React.createElement("td", { key: p.id, className: "ok" }, x.items[p.id] || "")),
+                                    React.createElement("td", null, x.qty || ""),
+                                    React.createElement("td", null, x.total ? fmtN(x.total) : ""),
+                                    React.createElement("td", { className: "ok" }, x.cash ? fmtN(x.cash) : ""),
+                                    React.createElement("td", { className: "ok" }, x.momo ? fmtN(x.momo) : ""),
+                                    React.createElement("td", null, x.creditM > 0 ? fmtN(x.creditM) : ""),
+                                    React.createElement("td", null, x.recTotal ? fmtN(x.recTotal) : ""),
+                                    React.createElement("td", { className: x.solde > 0 ? "red" : "" }, x.solde > 0 ? fmtN(x.solde) : ""),
+                                    React.createElement("td", null, x.objQ || ""),
+                                    React.createElement("td", { className: x.objQ && x.qty >= x.objQ ? "ok" : "" }, x.objQ ? Math.round(x.qty / x.objQ * 100) + "%" : "")))),
+                                prF.length > 0 && React.createElement("tr", { className: "tot" },
+                                    React.createElement("td", null, "Total"),
+                                    React.createElement("td", null),
+                                    React.createElement("td", null, S("nb")),
+                                    venProds.map((p) => React.createElement("td", { key: p.id, className: "ok" }, prF.reduce((a, x) => a + (x.items[p.id] || 0), 0) || "")),
+                                    React.createElement("td", null, q),
+                                    React.createElement("td", null, fmtN(S("total"))),
+                                    React.createElement("td", { className: "ok" }, fmtN(S("cash"))),
+                                    React.createElement("td", { className: "ok" }, fmtN(S("momo"))),
+                                    React.createElement("td", null, fmtN(prF.reduce((a, x) => a + Math.max(0, x.creditM), 0))),
+                                    React.createElement("td", null, fmtN(S("recTotal"))),
+                                    React.createElement("td", { className: "red" }, fmtN(prF.reduce((a, x) => a + Math.max(0, x.solde), 0))),
+                                    React.createElement("td", null, oq),
+                                    React.createElement("td", null, oq ? Math.round(q / oq * 100) + "%" : ""))))),
+                    !prF.length && React.createElement(Empty, null,
+                        "Aucun PDV",
+                        qPdv ? " ne correspond à cette recherche" : "",
+                        " ce mois."),
+                    pdvSel && React.createElement(PdvReportSheet, { data: data, x: pdvSel, m: m, onClose: () => setPdvSel(null) }));
+            })()),
         tab === "jour" && React.createElement(React.Fragment, null,
-            React.createElement("label", { className: "check" },
-                React.createElement("input", { type: "checkbox", checked: onlyActive, onChange: (e) => setOnlyActive(e.target.checked) }),
-                " Masquer les jours sans mouvement"),
-            React.createElement("p", { className: "help" }, "Colonnes produits : quantit\u00E9s enlev\u00E9es au d\u00E9p\u00F4t. Puis facture, versements et solde du compte, ventes du jour, encaiss\u00E9 (ventes et cr\u00E9dits r\u00E9gl\u00E9s) et cr\u00E9dit accord\u00E9."),
-            React.createElement("div", { className: "scroll" },
-                React.createElement("table", { className: "rep" },
-                    React.createElement("thead", null,
-                        React.createElement("tr", null,
-                            React.createElement("th", null, "Date"),
-                            prods.map((p) => React.createElement("th", { key: p.id, className: "pname" }, p.name)),
-                            React.createElement("th", null, "Total"),
-                            React.createElement("th", null, "Facture"),
-                            React.createElement("th", null, "Vers\u00E9"),
-                            React.createElement("th", null, "Solde"),
-                            React.createElement("th", null, "Ventes"),
-                            React.createElement("th", null, "Encaiss\u00E9"),
-                            React.createElement("th", null, "Cr\u00E9dit"))),
-                    React.createElement("tbody", null,
-                        React.createElement("tr", null,
-                            React.createElement("td", null, "Report"),
-                            prods.map((p) => React.createElement("td", { key: p.id })),
-                            React.createElement("td", null),
-                            React.createElement("td", null),
-                            React.createElement("td", null),
-                            React.createElement("td", null, fmtN(st.soldeAvant)),
-                            React.createElement("td", null),
-                            React.createElement("td", null),
-                            React.createElement("td", null)),
-                        days.map((d) => React.createElement("tr", { key: d.iso },
-                            React.createElement("td", null, dayLabel(d.iso)),
-                            prods.map((p) => React.createElement("td", { key: p.id }, d.re[p.id] || "")),
-                            React.createElement("td", null, qtyOf(d.re) || ""),
-                            React.createElement("td", null, d.fac ? fmtN(d.fac) : ""),
-                            React.createElement("td", null, d.ver ? fmtN(d.ver) : ""),
-                            React.createElement("td", { className: d.solde > 0 ? "red" : "" }, fmtN(d.solde)),
-                            React.createElement("td", null, d.vente ? fmtN(d.vente) : ""),
-                            React.createElement("td", null, d.enc ? fmtN(d.enc) : ""),
-                            React.createElement("td", { className: d.cred > 0 ? "red" : "" }, d.cred ? fmtN(d.cred) : ""))),
-                        React.createElement("tr", { className: "tot" },
-                            React.createElement("td", null, "Total"),
-                            prods.map((p) => React.createElement("td", { key: p.id }, st.real[p.id] || 0)),
-                            React.createElement("td", null, qtyOf(st.real)),
-                            React.createElement("td", null, fmtN(st.facture)),
-                            React.createElement("td", null, fmtN(st.verse)),
-                            React.createElement("td", null, fmtN(st.soldeFin)),
-                            React.createElement("td", null, fmtN(st.ventesTotal)),
-                            React.createElement("td", null, fmtN(st.encaisse)),
-                            React.createElement("td", null, fmtN(st.creditM)))))),
-            !prods.length && React.createElement("p", { className: "help" }, "Les colonnes produits apparaissent d\u00E8s qu'un produit est enlev\u00E9 ce mois.")),
+            React.createElement("div", { className: "jour-filters" },
+                React.createElement("label", { className: "check" },
+                    React.createElement("input", { type: "checkbox", checked: onlyActive, onChange: (e) => setOnlyActive(e.target.checked) }),
+                    " Jours actifs seulement"),
+                React.createElement("input", { className: "rep-search", value: jourFlt, onChange: (e) => setJourFlt(e.target.value), placeholder: "\uD83D\uDD0D Filtrer par date, PDV\u2026" })),
+            (() => {
+                const venProdsJ = data.products.filter((p) => prods.some((x) => x.id === p.id) || data.ventes.filter((v) => v.date.slice(0, 7) === m).some((v) => v.items[p.id]));
+                const daysF = jourFlt ? days.filter((d) => dayLabel(d.iso).toLowerCase().includes(jourFlt.toLowerCase())) : days;
+                return React.createElement("div", { className: "scroll" },
+                    React.createElement("table", { className: "rep" },
+                        React.createElement("thead", null,
+                            React.createElement("tr", null,
+                                React.createElement("th", null, "Date"),
+                                venProdsJ.map((p) => React.createElement("th", { key: p.id, className: "pname" }, p.name)),
+                                React.createElement("th", null, "Total"),
+                                React.createElement("th", null, "Facture"),
+                                React.createElement("th", null, "Vers\u00E9"),
+                                React.createElement("th", null, "Solde"),
+                                React.createElement("th", { className: "ok" }, "Ventes"),
+                                React.createElement("th", { className: "ok" }, "Encaiss\u00E9"),
+                                React.createElement("th", null, "Cr\u00E9dit")),
+                            React.createElement("tr", { className: "rep-frow" },
+                                React.createElement("th", null,
+                                    React.createElement("input", { className: "rep-finp", placeholder: "date", value: jourFlt, onChange: (e) => setJourFlt(e.target.value) })),
+                                venProdsJ.map((p) => React.createElement("th", { key: p.id })),
+                                ["", "", "", "", "", "", ""].map((_, i) => React.createElement("th", { key: i })))),
+                        React.createElement("tbody", null,
+                            React.createElement("tr", null,
+                                React.createElement("td", null, "Report"),
+                                venProdsJ.map((p) => React.createElement("td", { key: p.id })),
+                                React.createElement("td", null),
+                                React.createElement("td", null),
+                                React.createElement("td", null),
+                                React.createElement("td", null, fmtN(st.soldeAvant)),
+                                React.createElement("td", null),
+                                React.createElement("td", null),
+                                React.createElement("td", null)),
+                            daysF.map((d) => {
+                                const venJ = data.ventes.filter((v) => v.date === d.iso && !v.cancelled && !v.correctionOf);
+                                const venItems = sumItems(venJ);
+                                return React.createElement("tr", { key: d.iso },
+                                    React.createElement("td", null, dayLabel(d.iso)),
+                                    venProdsJ.map((p) => {
+                                        const enl = d.re[p.id] || 0;
+                                        const ven = venItems[p.id] || 0;
+                                        return React.createElement("td", { key: p.id },
+                                            enl > 0 && React.createElement("div", { style: { fontSize: 12, color: "var(--muted)" } },
+                                                "\u2191",
+                                                enl),
+                                            ven > 0 && React.createElement("div", { className: "ok", style: { fontWeight: 700 } },
+                                                "\u2192",
+                                                ven));
+                                    }),
+                                    React.createElement("td", null, qtyOf(d.re) || ""),
+                                    React.createElement("td", null, d.fac ? fmtN(d.fac) : ""),
+                                    React.createElement("td", null, d.ver ? fmtN(d.ver) : ""),
+                                    React.createElement("td", { className: d.solde > 0 ? "red" : "" }, fmtN(d.solde)),
+                                    React.createElement("td", { className: "ok" }, d.vente ? fmtN(d.vente) : ""),
+                                    React.createElement("td", { className: "ok" }, d.enc ? fmtN(d.enc) : ""),
+                                    React.createElement("td", { className: d.cred > 0 ? "red" : "" }, d.cred ? fmtN(d.cred) : ""));
+                            }),
+                            React.createElement("tr", { className: "tot" },
+                                React.createElement("td", null, "Total"),
+                                venProdsJ.map((p) => {
+                                    const tEnl = st.real[p.id] || 0;
+                                    const tVen = data.ventes.filter((v) => v.date.slice(0, 7) === m && !v.cancelled && !v.correctionOf).reduce((a, v) => a + (+v.items[p.id] || 0), 0);
+                                    return React.createElement("td", { key: p.id },
+                                        tEnl ? React.createElement("span", { style: { fontSize: 11, color: "var(--muted)" } },
+                                            "\u2191",
+                                            tEnl,
+                                            " ") : "",
+                                        tVen ? React.createElement("span", { className: "ok" },
+                                            "\u2192",
+                                            tVen) : "");
+                                }),
+                                React.createElement("td", null, qtyOf(st.real)),
+                                React.createElement("td", null, fmtN(st.facture)),
+                                React.createElement("td", null, fmtN(st.verse)),
+                                React.createElement("td", null, fmtN(st.soldeFin)),
+                                React.createElement("td", { className: "ok" }, fmtN(st.ventesTotal)),
+                                React.createElement("td", { className: "ok" }, fmtN(st.encaisse)),
+                                React.createElement("td", null, fmtN(st.creditM))))));
+            })(),
+            !prods.length && !data.ventes.filter((v) => v.date.slice(0, 7) === m).length && React.createElement("p", { className: "help" }, "Aucun mouvement ce mois.")),
         tab === "cre" && React.createElement("div", { className: "list" },
-            cre.map((c) => React.createElement("div", { className: "li", key: c.id },
+            cre.filter((c) => c.solde > 0).map((c) => React.createElement("div", { className: "li", key: c.id },
                 React.createElement("div", { className: "li-main" },
                     React.createElement("div", { className: "li-title" }, c.name),
-                    React.createElement("div", { className: "li-sub" }, place(c))),
+                    React.createElement("div", { className: "li-sub" }, [place(c), c.canal].filter(Boolean).join(" · "))),
                 React.createElement("div", { className: "li-amt red" }, fmtN(c.solde)))),
+            cre.filter((c) => c.solde > 0).length === 0 && React.createElement(Empty, null, "Aucune cr\u00E9ance en cours."),
             !cre.length && React.createElement(Empty, null, "Aucune cr\u00E9ance en cours.")));
 }
 /* ---------- Code de verrouillage (écran de confidentialité) ---------- */
@@ -19925,6 +20612,24 @@ class Boundary extends Component {
 }
 function AppRoot() { return React.createElement(Boundary, null,
     React.createElement(App, null)); }
+function Clock() {
+    const [now, setNow] = useState(new Date());
+    useEffect(() => { const t = setInterval(() => setNow(new Date()), 30000); return () => clearInterval(t); }, []);
+    const j = ["dim.", "lun.", "mar.", "mer.", "jeu.", "ven.", "sam."][now.getDay()];
+    const mo = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."][now.getMonth()];
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+    return React.createElement("span", { className: "clock" },
+        j,
+        " ",
+        now.getDate(),
+        " ",
+        mo,
+        " \u2014 ",
+        hh,
+        ":",
+        mm);
+}
 function App() {
     var _a, _b;
     const [data, setData] = useState(null);
@@ -20074,9 +20779,11 @@ function App() {
         React.createElement("style", null, CSS),
         React.createElement("header", { className: "top" },
             React.createElement("div", { className: "top-row" },
-                React.createElement("div", { className: "brand" },
-                    React.createElement(Logo, null),
-                    " Mon suivi terrain"),
+                React.createElement("div", null,
+                    React.createElement("div", { className: "brand" },
+                        React.createElement(Logo, null),
+                        " Mon suivi terrain")),
+                React.createElement(Clock, null),
                 React.createElement("button", { className: "icon", onClick: () => setModal({ type: "settings" }), "aria-label": "R\u00E9glages" },
                     React.createElement(Settings, { size: 21 }))),
             React.createElement("div", { className: "month" },
@@ -20103,6 +20810,8 @@ function App() {
         (modal === null || modal === void 0 ? void 0 : modal.type) === "recu" && React.createElement(ReceiptSheet, { data: vd, v: modal.v, toast: toast, onClose: close }),
         (modal === null || modal === void 0 ? void 0 : modal.type) === "targets" && React.createElement(TargetsForm, { data: vd, client: modal.client, targets: (data.pdvTargets[m] || {})[modal.client.id], onClose: close, onSave: (items) => { setData((d) => ({ ...d, pdvTargets: { ...d.pdvTargets, [m]: { ...(d.pdvTargets[m] || {}), [modal.client.id]: items } } })); done("Objectifs du PDV enregistrés"); } }),
         (modal === null || modal === void 0 ? void 0 : modal.type) === "liv" && React.createElement(LivraisonForm, { data: data, m: m, onClose: close, onSave: (l) => { add("livraisons", l); done("Livraison programmée"); } }),
+        (modal === null || modal === void 0 ? void 0 : modal.type) === "sortie" && React.createElement(SortieForm, { data: data, g: g, onClose: close, onSave: (x) => { add("sorties", x); done("Sortie enregistrée, stock mis à jour"); } }),
+        (modal === null || modal === void 0 ? void 0 : modal.type) === "editSortie" && React.createElement(SortieForm, { data: data, g: { ...g, stock: Object.fromEntries(Object.entries(g.stock).map(([k, v]) => [k, v + (+modal.rec.items[k] || 0)])) }, edit: modal.rec, onClose: close, onSave: (x) => { replace("sorties", { ...modal.rec, ...x, id: modal.rec.id }); done("Sortie modifiée"); } }),
         (modal === null || modal === void 0 ? void 0 : modal.type) === "vers" && React.createElement(VersementForm, { g: g, onClose: close, onSave: (v) => { add("versements", v); done("Versement enregistré, caisse mise à jour"); } }),
         (modal === null || modal === void 0 ? void 0 : modal.type) === "editEnl" && React.createElement(LoadForm, { data: vd, mode: "real", edit: modal.rec, onClose: close, onSave: (n) => editEnl(modal.rec, n) }),
         (modal === null || modal === void 0 ? void 0 : modal.type) === "corrEnl" && React.createElement(CorrEnlForm, { data: vd, g: g, orig: modal.rec, onClose: close, onSave: (c) => { add("enlevements", c); noteOn("enlevements", modal.rec.id, `Corrigé : ${c.motif}`); done("Correction enregistrée"); } }),
@@ -20399,6 +21108,88 @@ table.rep{border-collapse:collapse;font-family:'Barlow Condensed',sans-serif;fon
 .geo-card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:10px 12px;font-size:14px}
 .geo-card .chips{margin:8px 0 0}
 .receipt{background:#fff;border:1px solid var(--line);border-radius:12px;padding:12px;font:13px/1.6 ui-monospace,monospace;white-space:pre-wrap;color:var(--ink);margin:0 0 10px}
+.csearch{position:relative}
+.csearch input{width:100%;box-sizing:border-box}
+.csearch-drop{position:absolute;left:0;right:0;top:calc(100% + 4px);background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 4px 16px rgba(18,32,58,.12);z-index:99;max-height:260px;overflow-y:auto}
+.csearch-item{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--line)}
+.csearch-item:last-child{border-bottom:0}
+.csearch-item:hover,.csearch-item:active{background:var(--green-l)}
+.csearch-name{font-weight:600;flex:1}
+.csearch-sub{font-size:13px;color:var(--muted)}
+.clock{font-size:13px;font-weight:600;color:#fff;letter-spacing:.01em;line-height:1.3;text-align:right}
+.frac{border:1px solid var(--line);background:#fff;border-radius:6px;padding:1px 7px;font-size:16px;color:var(--ink);cursor:pointer}
+.frac.on{background:var(--green-l);border-color:var(--green);color:var(--green);font-weight:700}
+.remise-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:4px}
+.remise-cell{display:flex;flex-direction:column;gap:4px}
+.remise-lbl{font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.remise-inp{display:flex;align-items:center;gap:4px}
+.remise-inp input{flex:1;min-width:0;width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--line);border-radius:10px;font-size:17px;font-family:inherit}
+.remise-inp .mono-input{flex:1;min-width:0}
+.remise-unit{font-size:14px;font-weight:600;color:var(--muted);white-space:nowrap}
+.ct-row{display:flex;justify-content:space-between;align-items:center;padding:4px 12px;font-size:15px;gap:8px}
+.ct-row.tot{font-size:18px;font-weight:700;background:var(--green-l);padding:8px 12px;border-radius:0 0 10px 10px}
+del.brut{color:var(--muted);font-size:12px;font-weight:400}
+.cart-table{border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:10px}
+.ct-head{display:grid;grid-template-columns:1fr 68px 50px 50px 72px;gap:4px;padding:6px 10px;background:var(--green-l);font-size:12px;font-weight:700;color:var(--green)}
+.ct-prod{border-bottom:1px solid var(--line)}
+.ct-prod-top{display:flex;align-items:center;gap:8px;padding:8px 10px 4px}
+.ct-prod-name{flex:1;min-width:0}.ct-prod-name b{display:block;font-size:15px}.ct-prod-name small{font-size:11px;color:var(--muted)}
+.cart-img{width:48px;height:48px;object-fit:cover;border-radius:8px;flex-shrink:0}
+.cart-img-sm{width:36px;height:36px;object-fit:cover;border-radius:6px;flex-shrink:0}
+.ct-prod-row{display:grid;grid-template-columns:68px 1fr 72px;gap:4px;align-items:center;padding:4px 10px 8px}
+.ct-pu{font-size:14px;color:var(--muted)}
+.ct-rem2{display:flex;align-items:center;gap:2px}
+.ct-rem-inp{width:44px;border:1px solid var(--line);border-radius:6px;padding:4px 4px;font-size:13px;text-align:center;font-family:inherit;min-width:0}
+.ct-rem-inp:focus{border-color:var(--green);outline:none}
+.ct-rem-sep{color:var(--line);font-size:14px;flex-shrink:0}
+.ct-mnt{font-size:16px;text-align:right}
+del.ct-del{font-size:12px;font-weight:400;color:var(--muted)}
+.ct-total{display:grid;grid-template-columns:1fr 68px 1fr 72px;gap:4px;align-items:center;padding:10px 10px;background:var(--green-l);font-size:20px;font-weight:700}
+.ct-recap{display:flex;flex-wrap:wrap;gap:6px;padding:4px 10px 8px;font-size:12px;color:var(--muted);border-top:1px dashed var(--line)}
+.mpicker{border:1px solid var(--line);border-radius:12px;background:#fff;margin-bottom:10px;overflow:hidden}
+.mpicker-head{display:flex;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--paper)}
+.mpicker-search{flex:1;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:15px;font-family:inherit}
+.mpicker-list{max-height:340px;overflow-y:auto}
+.mpicker-fam{padding:6px 12px;font-size:12px;font-weight:700;color:var(--green);text-transform:uppercase;letter-spacing:.05em;background:var(--green-l)}
+.mpicker-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.mpicker-row input[type=checkbox]{width:20px;height:20px;flex-shrink:0;accent-color:var(--green)}
+.mpicker-row.on{background:var(--green-l)}
+.mpicker-row.incart{opacity:.65}
+.mpicker-img{width:36px;height:36px;object-fit:cover;border-radius:6px;flex-shrink:0}
+.mpicker-info{flex:1;min-width:0}.mpicker-info span{display:block;font-size:15px;font-weight:600}
+.mpicker-info small{color:var(--muted)}
+.mpicker-foot{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-top:1px solid var(--line);background:var(--paper)}
+.sortie-row{display:flex;align-items:center;gap:12px;padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--line)}
+.sortie-row.on{background:var(--green-l);border-left:4px solid var(--green)}
+.today-line{font-size:15px;font-weight:400;color:var(--muted);padding:0 0 10px;display:block}
+.today-line b{color:var(--ink);font-weight:700}
+.pdv-row{display:flex;align-items:flex-end;gap:8px;margin-bottom:10px}
+.pdv-row .field{flex:1;margin:0}
+.pdv-new{flex-shrink:0;white-space:nowrap}
+.li-stock-r-old{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.li-unit{font-size:11px;color:var(--muted)}
+.li-ctn{font-size:12px;font-weight:700;color:var(--green);background:var(--green-l);border-radius:6px;padding:2px 7px;white-space:nowrap}
+.rep th.ok{color:var(--green)}
+.rep-search{width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:14px;font-family:inherit;margin-bottom:8px}
+.rep-frow th{background:var(--green-l);padding:3px 4px}
+.rep-finp{width:100%;border:1px solid var(--line);border-radius:6px;padding:2px 4px;font-size:12px;font-family:inherit;box-sizing:border-box}
+.jour-filters{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
+.li-stock-r{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.li-ctn-big small{font-size:10px;font-weight:600;color:var(--green);text-transform:uppercase;display:block}
+.li-ctn-u small{font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;display:block}
+.sortie-prod-row{display:flex;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid var(--line)}
+.sortie-prod-row:last-child{border-bottom:0}
+.sortie-cdt-inp{display:flex;gap:6px;flex-shrink:0}
+.sortie-cdt-cell{display:flex;align-items:center;gap:3px}
+.sortie-cdt-cell button{width:28px;height:28px;border:1px solid var(--line);border-radius:6px;background:#fff;font-size:16px;font-weight:600;cursor:pointer;flex-shrink:0}
+.sortie-cdt-cell input{width:36px;text-align:center;border:1px solid var(--line);border-radius:6px;padding:4px 2px;font-size:15px;font-weight:700;font-family:inherit}
+.sortie-cdt-cell span{font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
+.li-ctn-display{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.li-ctn-big{display:flex;flex-direction:column;align-items:center;font-size:20px;font-weight:800;color:var(--green);line-height:1;min-width:28px;text-align:center}
+.li-ctn-big small{font-size:10px;font-weight:600;color:var(--green);text-transform:uppercase;display:block}
+.li-ctn-u{display:flex;flex-direction:column;align-items:center;font-size:18px;font-weight:700;color:var(--ink);line-height:1;border-left:2px solid var(--line);padding-left:6px;min-width:24px;text-align:center}
+.li-ctn-u small{font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;display:block}
+.li-ctn-u.op30{opacity:.35}
 .warn{background:#F7E1DF;color:var(--red);border-radius:10px;padding:10px 12px;font-size:14px;margin:0 0 12px}
 .ink{color:var(--ink)}
 .acts{display:flex;align-items:center;gap:4px}
